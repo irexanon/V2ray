@@ -1,18 +1,22 @@
-package com.example.ui
+package com.hollow.vpn.ui
 
 import android.app.Application
 import android.content.Intent
 import android.net.TrafficStats
+import android.provider.Settings
+import android.util.Base64
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.data.AppSettingsState
-import com.example.data.ServerEntity
-import com.example.data.ServerFilter
-import com.example.data.SubscriptionEntity
-import com.example.data.VpnDatabase
-import com.example.data.VpnPreferencesStore
-import com.example.vpn.V2RayParserAndFletcher
-import com.example.vpn.XrayVpnService
+import com.hollow.vpn.data.AppSettingsState
+import com.hollow.vpn.data.ServerEntity
+import com.hollow.vpn.data.ServerFilter
+import com.hollow.vpn.data.SubscriptionEntity
+import com.hollow.vpn.data.VpnDatabase
+import com.hollow.vpn.data.VpnPreferencesStore
+import com.hollow.vpn.vpn.V2RayParserAndFletcher
+import com.hollow.vpn.vpn.XrayVpnService
+import go.Seq
+import libv2ray.Libv2ray
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -26,6 +30,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
+import java.security.MessageDigest
 import kotlin.math.max
 
 enum class VpnScreen {
@@ -309,6 +314,15 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         _activeAddTab.value = tab
     }
 
+    /** Selects a server without starting the VPN. Used while Android shows its consent dialog. */
+    fun selectServer(server: ServerEntity, openConnectedScreen: Boolean = true) {
+        viewModelScope.launch {
+            dao.clearSelection()
+            dao.markSelected(server.id)
+            if (openConnectedScreen) navigateTo(VpnScreen.CONNECTED_HOME)
+        }
+    }
+
     fun selectAndConnectServer(server: ServerEntity, openConnectedScreen: Boolean = true) {
         viewModelScope.launch {
             dao.clearSelection()
@@ -481,6 +495,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
         viewModelScope.launch {
             _fetchingStatusMessage.value = "Auto configuring for you"
+            dao.deleteSubscriptionByUrl(input)
             dao.insertSubscription(
                 SubscriptionEntity(
                     url = input,
@@ -642,15 +657,34 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     fun pingSingleServer(server: ServerEntity) {
         viewModelScope.launch {
-            val livePing = withContext(Dispatchers.IO) {
-                fletcher.measureRealTcpLatencyOrNull(server.host, server.port, 1800)
-            }
+            val livePing = measureV2RayOutboundDelayOrNull(server)
             if (livePing != null) {
                 dao.updateServer(server.copy(pingMs = livePing))
-                showMessage("${server.countryName} live TCP ping: $livePing ms")
+                showMessage("${server.countryName} Xray ping: $livePing ms")
             } else {
-                showMessage("${server.countryName} (${server.host}:${server.port}) timed out")
+                showMessage("${server.countryName} (${server.host}:${server.port}) did not respond")
             }
+        }
+    }
+
+    /** Same native outbound-delay probe used by v2rayNG, against its standard 204 endpoint. */
+    private suspend fun measureV2RayOutboundDelayOrNull(server: ServerEntity): Int? = withContext(Dispatchers.IO) {
+        try {
+            val app = getApplication<Application>()
+            Seq.setContext(app)
+            val androidId = Settings.Secure.getString(app.contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
+            val deviceId = Base64.encodeToString(
+                MessageDigest.getInstance("SHA-256").digest(androidId.toByteArray()).copyOf(32),
+                Base64.NO_PADDING or Base64.URL_SAFE or Base64.NO_WRAP
+            )
+            val assetPath = (app.getExternalFilesDir("assets") ?: app.getDir("assets", 0)).absolutePath
+            Libv2ray.initCoreEnv(assetPath, deviceId)
+            val config = server.rawConfigJson.ifBlank { fletcher.generateXrayJsonForServer(server) }
+            val delay = Libv2ray.measureOutboundDelay(config, "https://www.gstatic.com/generate_204")
+            if (delay > 0L) delay.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            else fletcher.measureRealTcpLatencyOrNull(server.host, server.port, 1800)
+        } catch (_: Throwable) {
+            fletcher.measureRealTcpLatencyOrNull(server.host, server.port, 1800)
         }
     }
 
@@ -751,6 +785,12 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 putExtra(XrayVpnService.EXTRA_ENABLE_IPV6, currentSettings.ipv6Enabled)
                 putExtra(XrayVpnService.EXTRA_DNS_MODE, currentSettings.dnsMode)
                 putExtra(XrayVpnService.EXTRA_ROUTING_MODE, currentSettings.routingMode)
+                putExtra(XrayVpnService.EXTRA_PER_APP_PROXY_ENABLED, currentSettings.perAppProxyEnabled)
+                putExtra(XrayVpnService.EXTRA_BYPASS_SELECTED_APPS, currentSettings.bypassSelectedApps)
+                putStringArrayListExtra(
+                    XrayVpnService.EXTRA_SELECTED_APP_PACKAGES,
+                    ArrayList(currentSettings.selectedAppPackages)
+                )
             }
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
                 ctx.startForegroundService(intent)

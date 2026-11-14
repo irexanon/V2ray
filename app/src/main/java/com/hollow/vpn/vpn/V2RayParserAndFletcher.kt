@@ -1,8 +1,8 @@
-package com.example.vpn
+package com.hollow.vpn.vpn
 
 import android.util.Base64
-import com.example.data.AppSettingsState
-import com.example.data.ServerEntity
+import com.hollow.vpn.data.AppSettingsState
+import com.hollow.vpn.data.ServerEntity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -868,7 +868,7 @@ class V2RayParserAndFletcher {
                         uuidOrPassword = credential,
                         sni = sni,
                         publicKey = pbk,
-                        rawConfigJson = root.toString(2),
+                        rawConfigJson = buildSingleServerConfig(root, outbound).toString(2),
                         pingMs = 0,
                         isCustom = isCustom
                     )
@@ -878,6 +878,38 @@ class V2RayParserAndFletcher {
         } catch (_: Exception) {
             emptyList()
         }
+    }
+
+    /** Give each saved row an isolated outbound; Shadowsocks rejects multiple servers in one outbound. */
+    private fun buildSingleServerConfig(root: JSONObject, sourceOutbound: JSONObject): JSONObject {
+        val config = JSONObject()
+        root.optJSONObject("log")?.let { config.put("log", JSONObject(it.toString())) }
+
+        val inbounds = root.optJSONArray("inbounds")?.let { JSONArray(it.toString()) } ?: JSONArray()
+        if ((0 until inbounds.length()).none { inbounds.optJSONObject(it)?.optString("protocol") == "tun" }) {
+            inbounds.put(
+                JSONObject()
+                    .put("tag", "tun-in")
+                    .put("protocol", "tun")
+                    .put("settings", JSONObject().put("name", "xray0").put("MTU", 1500).put("userLevel", 8))
+                    .put("sniffing", JSONObject().put("enabled", true).put("destOverride", JSONArray().put("http").put("tls").put("quic")))
+            )
+        }
+        config.put("inbounds", inbounds)
+
+        val outbound = JSONObject(sourceOutbound.toString())
+        val settings = outbound.optJSONObject("settings")
+        if (settings != null) {
+            settings.optJSONArray("servers")?.let { servers ->
+                if (servers.length() > 0) settings.put("servers", JSONArray().put(JSONObject(servers.getJSONObject(0).toString())) )
+            }
+            settings.optJSONArray("vnext")?.let { vnext ->
+                if (vnext.length() > 0) settings.put("vnext", JSONArray().put(JSONObject(vnext.getJSONObject(0).toString())) )
+            }
+            outbound.put("settings", settings)
+        }
+        config.put("outbounds", JSONArray().put(outbound).put(JSONObject().put("tag", "direct").put("protocol", "freedom")))
+        return config
     }
 
     fun generateXrayJsonForServer(server: ServerEntity): String {
@@ -902,13 +934,26 @@ class V2RayParserAndFletcher {
   },
   "inbounds": [
     {
-      "tag": "tun-in",
+      "tag": "socks-in",
       "port": 10808,
       "listen": "127.0.0.1",
       "protocol": "socks",
       "settings": {
         "auth": "noauth",
         "udp": true
+      }
+    },
+    {
+      "tag": "tun-in",
+      "protocol": "tun",
+      "settings": {
+        "name": "xray0",
+        "MTU": 1500,
+        "userLevel": 8
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
       }
     }
   ],
