@@ -7,11 +7,11 @@
 -keep class * extends androidx.room.RoomDatabase
 -keep @androidx.room.Entity class * { *; }
 -keep @androidx.room.Dao interface * { *; }
--keep class com.example.data.** { *; }
+-keep class com.hollow.vpn.data.** { *; }
 
 # Keep Android VpnService, MainActivity, and optional native libv2ray / go JNI bindings
--keep class com.example.vpn.XrayVpnService { *; }
--keep class com.example.MainActivity { *; }
+-keep class com.hollow.vpn.vpn.XrayVpnService { *; }
+-keep class com.hollow.vpn.MainActivity { *; }
 -keep class libv2ray.** { *; }
 -keep class go.** { *; }
 -dontwarn libv2ray.**
@@ -28,3 +28,6 @@
 -dontwarn javax.annotation.**
 -dontwarn org.conscrypt.**
 -keepnames class okhttp3.internal.publicsuffix.PublicSuffixDatabase
+
+# ZXing QR scanner rules
+-dontwarn com.google.zxing.**

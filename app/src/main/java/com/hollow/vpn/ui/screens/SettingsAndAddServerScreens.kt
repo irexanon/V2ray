@@ -4,6 +4,9 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -83,7 +86,9 @@ import com.hollow.vpn.R
 import com.hollow.vpn.data.AppSettingsState
 import com.hollow.vpn.data.ServerEntity
 import com.hollow.vpn.ui.AddServerTab
+import com.hollow.vpn.ui.components.CameraQrScannerDialog
 import com.hollow.vpn.ui.components.SageOrganicBackground
+import com.hollow.vpn.ui.components.decodeQrFromUri
 import com.hollow.vpn.ui.theme.DisconnectCrimson
 import com.hollow.vpn.ui.theme.DividerSage
 import com.hollow.vpn.ui.theme.EmeraldSwitchActive
@@ -658,6 +663,23 @@ fun AddServerScreen(
 
     // QR Code URI state
     var qrUriPayload by remember { mutableStateOf("") }
+    var showCameraQrScanner by remember { mutableStateOf(false) }
+    var qrDecodeStatus by remember { mutableStateOf<String?>(null) }
+
+    val qrGalleryLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) {
+            val decoded = decodeQrFromUri(context, uri)
+            if (!decoded.isNullOrBlank()) {
+                qrUriPayload = decoded
+                qrDecodeStatus = null
+                onImportClipboardText(decoded)
+            } else {
+                qrDecodeStatus = "Could not detect a QR code in that image."
+            }
+        }
+    }
 
     SageOrganicBackground {
         Column(
@@ -1159,10 +1181,71 @@ fun AddServerScreen(
                             )
 
                             Text(
-                                text = "Paste or decode a V2Ray QR URI (vless://, vmess://, trojan://, ss://) to import and benchmark latency immediately.",
+                                text = "Scan a V2Ray QR code using your camera, pick a QR screenshot from gallery, or paste a decoded URI below.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = TextSecondaryMuted
                             )
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Surface(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(48.dp)
+                                        .clip(RoundedCornerShape(50))
+                                        .clickable { showCameraQrScanner = true }
+                                        .testTag("btn_scan_camera_qr"),
+                                    shape = RoundedCornerShape(50),
+                                    color = ForestEmerald
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Text(
+                                            text = "Scan Camera",
+                                            style = MaterialTheme.typography.labelLarge.copy(
+                                                fontWeight = FontWeight.SemiBold,
+                                                fontSize = 13.5.sp
+                                            ),
+                                            color = Color.White
+                                        )
+                                    }
+                                }
+                                Surface(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(48.dp)
+                                        .clip(RoundedCornerShape(50))
+                                        .clickable {
+                                            qrGalleryLauncher.launch(
+                                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                            )
+                                        }
+                                        .testTag("btn_pick_qr_image"),
+                                    shape = RoundedCornerShape(50),
+                                    color = InputFieldBg,
+                                    border = BorderStroke(1.dp, SubtleCardBorder)
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Text(
+                                            text = "From Gallery",
+                                            style = MaterialTheme.typography.labelLarge.copy(
+                                                fontWeight = FontWeight.SemiBold,
+                                                fontSize = 13.5.sp
+                                            ),
+                                            color = TextPrimaryDark
+                                        )
+                                    }
+                                }
+                            }
+
+                            if (!qrDecodeStatus.isNullOrBlank()) {
+                                Text(
+                                    text = qrDecodeStatus.orEmpty(),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = DisconnectCrimson
+                                )
+                            }
 
                             OutlinedTextField(
                                 value = qrUriPayload,
@@ -1205,6 +1288,18 @@ fun AddServerScreen(
 
             Spacer(modifier = Modifier.height(28.dp))
         }
+    }
+
+    if (showCameraQrScanner) {
+        CameraQrScannerDialog(
+            onQrDecoded = { decoded ->
+                showCameraQrScanner = false
+                qrUriPayload = decoded
+                qrDecodeStatus = null
+                onImportClipboardText(decoded)
+            },
+            onDismiss = { showCameraQrScanner = false }
+        )
     }
 
     if (showIntervalPicker) {

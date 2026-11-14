@@ -55,26 +55,46 @@ class XrayVpnService : VpnService() {
         val port = intent?.getIntExtra(EXTRA_SERVER_PORT, 443) ?: 443
         val protocol = intent?.getStringExtra(EXTRA_SERVER_PROTOCOL) ?: "VLESS (V2Ray)"
         val xrayJson = intent?.getStringExtra(EXTRA_XRAY_JSON).orEmpty()
+        val tunMode = intent?.getBooleanExtra(EXTRA_TUN_MODE, true) ?: true
         val enableIpv6 = intent?.getBooleanExtra(EXTRA_ENABLE_IPV6, false) ?: false
         val dnsMode = intent?.getStringExtra(EXTRA_DNS_MODE) ?: "Auto (DoH)"
         val routingMode = intent?.getStringExtra(EXTRA_ROUTING_MODE) ?: "Global"
         val perAppProxyEnabled = intent?.getBooleanExtra(EXTRA_PER_APP_PROXY_ENABLED, false) ?: false
         val bypassSelectedApps = intent?.getBooleanExtra(EXTRA_BYPASS_SELECTED_APPS, false) ?: false
         val selectedAppPackages = intent?.getStringArrayListExtra(EXTRA_SELECTED_APP_PACKAGES).orEmpty().toSet()
+        if (tunMode && prepare(this) != null) {
+            fail("VPN permission not granted by Android OS")
+            stopSelf()
+            return START_NOT_STICKY
+        }
         if (host.isBlank() || xrayJson.isBlank()) {
             fail("The selected server has no usable Xray configuration")
             stopSelf()
             return START_NOT_STICKY
         }
-        startVpnTunnel(country, host, port, protocol, xrayJson, enableIpv6, dnsMode, routingMode, perAppProxyEnabled, bypassSelectedApps, selectedAppPackages)
+        startVpnTunnel(country, host, port, protocol, xrayJson, tunMode, enableIpv6, dnsMode, routingMode, perAppProxyEnabled, bypassSelectedApps, selectedAppPackages)
         return START_NOT_STICKY
     }
 
-    private fun startVpnTunnel(country: String, host: String, port: Int, protocol: String, xrayJson: String, enableIpv6: Boolean, dnsMode: String, routingMode: String, perAppProxyEnabled: Boolean, bypassSelectedApps: Boolean, selectedAppPackages: Set<String>) {
+    private fun startVpnTunnel(
+        country: String,
+        host: String,
+        port: Int,
+        protocol: String,
+        xrayJson: String,
+        tunMode: Boolean,
+        enableIpv6: Boolean,
+        dnsMode: String,
+        routingMode: String,
+        perAppProxyEnabled: Boolean,
+        bypassSelectedApps: Boolean,
+        selectedAppPackages: Set<String>
+    ) {
         stopVpnTunnel()
         createNotificationChannel()
         try {
-            startForeground(NOTIFICATION_ID, buildForegroundNotification(country, host, protocol))
+            val subtitle = if (tunMode) "$protocol · $host" else "Proxy 127.0.0.1:10808 · $host"
+            startForeground(NOTIFICATION_ID, buildForegroundNotification(country, subtitle))
         } catch (e: Exception) {
             fail("Could not start VPN notification: ${e.message}")
             stopSelf()
@@ -82,35 +102,40 @@ class XrayVpnService : VpnService() {
         }
         tunnelJob = serviceScope.launch {
             try {
-                val builder = Builder()
-                    .setSession("Hollow VPN - $country ($host)")
-                    .setMtu(VPN_MTU)
-                    .addAddress("10.26.0.1", 30)
-                    .addDnsServer(selectedDns(dnsMode))
-                configurePerAppRouting(builder, perAppProxyEnabled, bypassSelectedApps, selectedAppPackages)
-                if (!routingMode.contains("Direct Only", ignoreCase = true)) {
-                    builder.addRoute("0.0.0.0", 0)
+                var tunFd = 0
+                if (tunMode) {
+                    val builder = Builder()
+                        .setSession("Hollow VPN - $country ($host)")
+                        .setMtu(VPN_MTU)
+                        .addAddress("10.26.0.1", 30)
+                        .addDnsServer(selectedDns(dnsMode))
+                    configurePerAppRouting(builder, perAppProxyEnabled, bypassSelectedApps, selectedAppPackages)
+                    if (!routingMode.contains("Direct Only", ignoreCase = true)) {
+                        builder.addRoute("0.0.0.0", 0)
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) builder.setMetered(false)
+                    if (enableIpv6) {
+                        builder.addAddress("fd00:26::1", 126)
+                        builder.addRoute("::", 0)
+                    }
+                    if (routingMode.contains("Direct Only", ignoreCase = true)) {
+                        builder.addRoute("10.26.0.0", 30)
+                    }
+                    vpnInterface?.close()
+                    vpnInterface = builder.establish() ?: error("Android OS rejected TUN interface creation")
+                    tunFd = vpnInterface?.fd ?: 0
                 }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) builder.setMetered(false)
-                if (enableIpv6) {
-                    builder.addAddress("fd00:26::1", 126)
-                    builder.addRoute("::", 0)
-                }
-                if (routingMode.contains("Direct Only", ignoreCase = true)) {
-                    builder.addRoute("10.26.0.0", 30)
-                }
-                vpnInterface?.close()
-                vpnInterface = builder.establish() ?: error("Android OS rejected TUN interface creation")
 
                 initializeXray()
                 val core = Libv2ray.newCoreController(CoreCallback())
                 // Match v2rayNG's proven architecture: Xray owns the Android TUN
-                // descriptor directly, so no executable tun2socks bridge is needed.
-                core.startLoop(xrayJson, vpnInterface?.fd ?: 0)
+                // descriptor directly when tunMode is enabled, or runs local SOCKS/HTTP
+                // proxy mode when tunFd == 0.
+                core.startLoop(xrayJson, tunFd)
                 coreController = core
                 _lastError.value = null
                 _isServiceRunning.value = true
-                while (isActive && vpnInterface != null) delay(500L)
+                while (isActive && (!tunMode || vpnInterface != null)) delay(500L)
             } catch (e: Exception) {
                 fail("Connection failed: ${e.message ?: "native VPN engine unavailable"}")
                 stopVpnTunnel()
@@ -197,13 +222,13 @@ class XrayVpnService : VpnService() {
         }
     }
 
-    private fun buildForegroundNotification(country: String, host: String, protocol: String): Notification {
+    private fun buildForegroundNotification(country: String, subtitle: String): Notification {
         val openIntent = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java).apply { flags = Intent.FLAG_ACTIVITY_SINGLE_TOP }, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val disconnectIntent = PendingIntent.getService(this, 1, Intent(this, XrayVpnService::class.java).apply { action = ACTION_DISCONNECT }, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentTitle("Hollow VPN · $country")
-            .setContentText("$protocol · $host")
+            .setContentText(subtitle)
             .setContentIntent(openIntent)
             .addAction(0, "Disconnect", disconnectIntent)
             .setOngoing(true)
@@ -212,8 +237,22 @@ class XrayVpnService : VpnService() {
 
     private inner class CoreCallback : CoreCallbackHandler {
         override fun startup(): Long = 0
-        override fun shutdown(): Long = 0
-        override fun onEmitStatus(level: Long, message: String?): Long = 0
+        override fun shutdown(): Long {
+            Log.w(TAG, "Xray core reported shutdown")
+            if (_isServiceRunning.value) {
+                serviceScope.launch {
+                    stopVpnTunnel()
+                    stopSelf()
+                }
+            }
+            return 0
+        }
+        override fun onEmitStatus(level: Long, message: String?): Long {
+            if (!message.isNullOrBlank()) {
+                Log.d(TAG, "Xray[$level]: $message")
+            }
+            return 0
+        }
     }
 
     companion object {
@@ -224,6 +263,7 @@ class XrayVpnService : VpnService() {
         const val EXTRA_SERVER_PORT = "extra_server_port"
         const val EXTRA_SERVER_PROTOCOL = "extra_server_protocol"
         const val EXTRA_XRAY_JSON = "extra_xray_json"
+        const val EXTRA_TUN_MODE = "extra_tun_mode"
         const val EXTRA_ENABLE_IPV6 = "extra_enable_ipv6"
         const val EXTRA_DNS_MODE = "extra_dns_mode"
         const val EXTRA_ROUTING_MODE = "extra_routing_mode"

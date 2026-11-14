@@ -333,12 +333,15 @@ fun SignalStrengthBars(
     pingMs: Int,
     modifier: Modifier = Modifier
 ) {
-    val isLowPing = pingMs < 90
-    val activeColor = if (isLowPing) SignalLowPingGreen else SignalMedPingAmber
+    val activeColor = when {
+        pingMs in 1..89 -> SignalLowPingGreen
+        pingMs in 90..179 -> SignalMedPingAmber
+        else -> com.hollow.vpn.ui.theme.SignalHighPingCoral
+    }
     val activeBars = when {
-        pingMs < 75 -> 3
-        pingMs < 130 -> 2
-        else -> 2
+        pingMs in 1..89 -> 3
+        pingMs in 90..179 -> 2
+        else -> 1
     }
 
     Row(

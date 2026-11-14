@@ -1,5 +1,5 @@
 {
-  "name": "V2Ray VPN",
+  "name": "Hollow VPN",
   "description": "Minimal Material 3 V2Ray and Xray VPN client with custom server import, subscription auto-fetcher, and Top 15 fastest server ping ranker.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]

@@ -77,6 +77,7 @@ fun HollowVpnApp(
     val context = LocalContext.current
     val currentScreen by vpnViewModel.currentScreen.collectAsStateWithLifecycle()
     val filteredServers by vpnViewModel.filteredServers.collectAsStateWithLifecycle()
+    val selectedFilter by vpnViewModel.selectedFilter.collectAsStateWithLifecycle()
     val selectedServer by vpnViewModel.selectedServer.collectAsStateWithLifecycle()
     val telemetry by vpnViewModel.telemetry.collectAsStateWithLifecycle()
     val settings by vpnViewModel.settings.collectAsStateWithLifecycle()
@@ -115,7 +116,7 @@ fun HollowVpnApp(
 
     val requestOrToggleVpn = {
         val prepareIntent = try {
-            if (!telemetry.isConnected) VpnService.prepare(context) else null
+            if (settings.tunMode && !telemetry.isConnected) VpnService.prepare(context) else null
         } catch (_: Exception) {
             null
         }
@@ -145,9 +146,15 @@ fun HollowVpnApp(
                 VpnScreen.SERVER_LIST -> {
                     CountryServerListScreen(
                         servers = filteredServers,
+                        selectedFilter = selectedFilter,
+                        activeProtocolPreference = settings.protocolPreference,
+                        onSelectFilter = vpnViewModel::setFilter,
+                        onResetProtocolFilter = {
+                            vpnViewModel.updateSettings { it.copy(protocolPreference = "Auto (V2Ray)") }
+                        },
                         onSelectServer = { server ->
                             val prepareIntent = try {
-                                VpnService.prepare(context)
+                                if (settings.tunMode) VpnService.prepare(context) else null
                             } catch (_: Exception) {
                                 null
                             }
@@ -198,7 +205,8 @@ fun HollowVpnApp(
                         },
                         onOpenAddServer = {
                             vpnViewModel.navigateTo(VpnScreen.ADD_SERVER)
-                        }
+                        },
+                        onRefreshRealIp = vpnViewModel::refreshRealPublicIp
                     )
                 }
 

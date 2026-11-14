@@ -61,6 +61,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -429,6 +430,7 @@ fun ServerItemRowContent(
     onDelete: () -> Unit
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
+    val context = LocalContext.current
 
     Row(
         modifier = Modifier
@@ -542,6 +544,17 @@ fun ServerItemRowContent(
                     }
                 )
                 DropdownMenuItem(
+                    text = { Text(if (server.shareUri.isNotBlank()) "Copy Share URI" else "Copy Xray Config") },
+                    onClick = {
+                        menuExpanded = false
+                        val payload = server.shareUri.ifBlank { server.rawConfigJson }
+                        if (payload.isNotBlank()) {
+                            val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                            cm?.setPrimaryClip(android.content.ClipData.newPlainText("Hollow VPN Server", payload))
+                        }
+                    }
+                )
+                DropdownMenuItem(
                     text = { Text("Delete Server", color = DisconnectCrimson) },
                     onClick = {
                         menuExpanded = false
@@ -564,7 +577,8 @@ fun ConnectedHomeScreen(
     onToggleConnect: () -> Unit,
     onOpenServerList: () -> Unit,
     onOpenSettings: () -> Unit,
-    onOpenAddServer: () -> Unit
+    onOpenAddServer: () -> Unit,
+    onRefreshRealIp: () -> Unit = {}
 ) {
     val activeCountryName = selectedServer?.countryName ?: "Select Server"
     val activeCountryCode = selectedServer?.countryCode ?: "DE"
@@ -573,11 +587,6 @@ fun ConnectedHomeScreen(
     val cleanServerIp = selectedServer?.resolvedIp?.takeIf { it.isNotBlank() }
         ?: selectedServer?.host?.takeIf { it.isNotBlank() }
         ?: telemetry.serverIpLabel
-    val effectiveRealIp = if (telemetry.isConnected && !cleanServerIp.isNullOrBlank() && cleanServerIp != "—") {
-        cleanServerIp
-    } else {
-        telemetry.realPublicIpLabel
-    }
     SageOrganicBackground {
         Column(
             modifier = Modifier
@@ -743,7 +752,9 @@ fun ConnectedHomeScreen(
                         icon = Icons.Outlined.LocationOn,
                         label = "Real IP",
                         value = telemetry.realPublicIpLabel,
-                        flagCode = telemetry.realPublicCountryCode
+                        flagCode = telemetry.realPublicCountryCode,
+                        onClick = onRefreshRealIp,
+                        modifier = Modifier.testTag("row_real_ip")
                     )
                     HorizontalDivider(
                         modifier = Modifier.padding(horizontal = 16.dp),
@@ -770,6 +781,7 @@ fun ConnectedHomeScreen(
 
             // Bottom Action Pill Button: Soft Coral "Disconnect" (or Forest Emerald "Connect")
             val isConnected = telemetry.isConnected
+            val isConnecting = telemetry.isConnecting
             Surface(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -778,7 +790,7 @@ fun ConnectedHomeScreen(
                     .clickable(onClick = onToggleConnect)
                     .testTag("bottom_disconnect_connect_button"),
                 shape = RoundedCornerShape(50),
-                color = if (isConnected) DisconnectPillBg else ForestEmerald
+                color = if (isConnected || isConnecting) DisconnectPillBg else ForestEmerald
             ) {
                 Row(
                     modifier = Modifier.fillMaxSize(),
@@ -795,6 +807,15 @@ fun ConnectedHomeScreen(
                         Spacer(modifier = Modifier.width(10.dp))
                         Text(
                             text = stringResource(R.string.action_disconnect),
+                            style = MaterialTheme.typography.titleMedium.copy(
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 15.5.sp
+                            ),
+                            color = DisconnectCrimson
+                        )
+                    } else if (isConnecting) {
+                        Text(
+                            text = stringResource(R.string.status_connecting),
                             style = MaterialTheme.typography.titleMedium.copy(
                                 fontWeight = FontWeight.SemiBold,
                                 fontSize = 15.5.sp
@@ -831,12 +852,22 @@ private fun TelemetryInfoRow(
     icon: ImageVector,
     label: String,
     value: String,
-    flagCode: String? = null
+    flagCode: String? = null,
+    onClick: (() -> Unit)? = null,
+    modifier: Modifier = Modifier
 ) {
-    Row(
-        modifier = Modifier
+    val rowModifier = if (onClick != null) {
+        modifier
             .fillMaxWidth()
-            .padding(horizontal = 18.dp, vertical = 13.dp),
+            .clickable(onClick = onClick)
+            .padding(horizontal = 18.dp, vertical = 13.dp)
+    } else {
+        modifier
+            .fillMaxWidth()
+            .padding(horizontal = 18.dp, vertical = 13.dp)
+    }
+    Row(
+        modifier = rowModifier,
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {

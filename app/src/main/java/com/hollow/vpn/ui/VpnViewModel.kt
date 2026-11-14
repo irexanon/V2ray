@@ -124,24 +124,26 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     val filteredServers: StateFlow<List<ServerEntity>> = combine(
         allServers,
-        _selectedFilter
-    ) { servers, filter ->
+        _selectedFilter,
+        _settings
+    ) { servers, filter, settings ->
+        val protocolFiltered = filterByProtocolPreference(servers, settings.protocolPreference)
         when (filter) {
             ServerFilter.ALL -> {
-                servers.sortedWith(
+                protocolFiltered.sortedWith(
                     compareByDescending<ServerEntity> { it.isSelected }
                         .thenBy { it.pingMs }
                 )
             }
             ServerFilter.RECOMMENDED -> {
-                servers.sortedBy { it.pingMs }.take(15)
+                protocolFiltered.sortedBy { it.pingMs }.take(15)
             }
             ServerFilter.LOW_PING -> {
-                val threshold = servers.map { it.pingMs }.minOrNull()?.let { max(120, it + 45) } ?: 120
-                servers.filter { it.pingMs in 1..threshold }.sortedBy { it.pingMs }
+                val threshold = protocolFiltered.map { it.pingMs }.minOrNull()?.let { max(120, it + 45) } ?: 120
+                protocolFiltered.filter { it.pingMs in 1..threshold }.sortedBy { it.pingMs }
             }
             ServerFilter.HIGH_SPEED -> {
-                servers.filter {
+                protocolFiltered.filter {
                     it.transport.equals("Reality", ignoreCase = true) ||
                         it.transport.equals("VLESS", ignoreCase = true) ||
                         it.transport.equals("gRPC", ignoreCase = true) ||
@@ -155,6 +157,23 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         initialValue = emptyList()
     )
 
+    private fun filterByProtocolPreference(
+        servers: List<ServerEntity>,
+        preference: String
+    ): List<ServerEntity> {
+        return when (preference) {
+            "VLESS (Reality)" -> servers.filter { it.transport.equals("Reality", ignoreCase = true) }
+            "VLESS (WS / TCP)" -> servers.filter {
+                it.protocolCore.contains("VLESS", ignoreCase = true) && !it.transport.equals("Reality", ignoreCase = true)
+            }
+            "VMess (WebSocket)" -> servers.filter { it.protocolCore.contains("VMess", ignoreCase = true) }
+            "Trojan (TLS)" -> servers.filter { it.protocolCore.contains("Trojan", ignoreCase = true) }
+            "gRPC" -> servers.filter { it.transport.equals("gRPC", ignoreCase = true) }
+            "Shadowsocks" -> servers.filter { it.protocolCore.contains("Shadowsocks", ignoreCase = true) }
+            else -> servers
+        }
+    }
+
     val selectedServer: StateFlow<ServerEntity?> = allServers.combine(_telemetry) { list, _ ->
         list.firstOrNull { it.isSelected } ?: list.firstOrNull()
     }.stateIn(
@@ -164,6 +183,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     )
 
     private var timerJob: Job? = null
+    private var autoUpdateJob: Job? = null
+    private var ipRefreshJob: Job? = null
     private var baselineTxBytes: Long = 0L
     private var baselineRxBytes: Long = 0L
 
@@ -172,6 +193,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         refreshRealPublicIp()
         initializeLiveServersOnStartup()
         startRealTrafficTelemetryLoop()
+        startSubscriptionAutoUpdateLoop()
     }
 
     /**
@@ -180,11 +202,13 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
      * the UI immediately shows Disconnected.
      */
     private fun observeVpnServiceState() {
+        var wasRunning = false
         viewModelScope.launch {
             XrayVpnService.isServiceRunning.collect { running ->
                 if (running) {
-                    baselineTxBytes = safeTrafficStat { TrafficStats.getTotalTxBytes() }
-                    baselineRxBytes = safeTrafficStat { TrafficStats.getTotalRxBytes() }
+                    wasRunning = true
+                    baselineTxBytes = readAppTxBytes()
+                    baselineRxBytes = readAppRxBytes()
                     _telemetry.update {
                         it.copy(
                             isConnected = true,
@@ -194,12 +218,26 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                             downloadBytes = 0L
                         )
                     }
+                    // Verify live exit IP through the active tunnel once routes settle
+                    ipRefreshJob?.cancel()
+                    ipRefreshJob = viewModelScope.launch {
+                        delay(1500L)
+                        refreshRealPublicIp()
+                    }
                 } else {
                     _telemetry.update {
                         it.copy(
                             isConnected = false,
                             isConnecting = false
                         )
+                    }
+                    if (wasRunning) {
+                        wasRunning = false
+                        ipRefreshJob?.cancel()
+                        ipRefreshJob = viewModelScope.launch {
+                            delay(600L)
+                            refreshRealPublicIp()
+                        }
                     }
                 }
             }
@@ -233,7 +271,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val existing = dao.getAllServersOnce()
             val canAutoConnect = _settings.value.startOnAppOpen &&
-                android.net.VpnService.prepare(getApplication()) == null
+                (!_settings.value.tunMode || android.net.VpnService.prepare(getApplication()) == null)
             if (existing.isEmpty() || _settings.value.autoConfigure) {
                 runFletcherAutoFetchAndPingSweep(
                     returnScreen = VpnScreen.CONNECTED_HOME,
@@ -250,8 +288,58 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun startSubscriptionAutoUpdateLoop() {
+        autoUpdateJob?.cancel()
+        autoUpdateJob = viewModelScope.launch {
+            while (true) {
+                delay(60_000L)
+                val current = _settings.value
+                if (!current.subAutoUpdate) continue
+                if (_telemetry.value.isConnecting || _currentScreen.value == VpnScreen.SPLASH_FETCHING) continue
+
+                val intervalMs = parseIntervalMillis(current.updateIntervalLabel)
+                val latestSub = dao.getSubscriptionsOnce().firstOrNull()
+                val lastFetched = latestSub?.lastFetchedAt ?: 0L
+                val targetUrl = latestSub?.url?.takeIf { it.isNotBlank() } ?: current.activeSubscriptionUrl
+
+                if (lastFetched > 0L && System.currentTimeMillis() - lastFetched >= intervalMs && targetUrl.isNotBlank()) {
+                    val result = fletcher.fetchSubscriptionAndRankTop15(targetUrl)
+                    result.onSuccess { ranked ->
+                        if (current.subReplaceExisting) {
+                            dao.deleteFetchedServers()
+                        }
+                        dao.clearSelection()
+                        val marked = ranked.mapIndexed { index, srv -> srv.copy(isSelected = index == 0) }
+                        dao.insertServers(marked)
+                        dao.deleteSubscriptionByUrl(targetUrl)
+                        dao.insertSubscription(
+                            SubscriptionEntity(
+                                url = targetUrl,
+                                autoUpdate = current.subAutoUpdate,
+                                updateIntervalHours = (intervalMs / 3_600_000L).toInt().coerceAtLeast(1),
+                                replaceExisting = current.subReplaceExisting,
+                                lastFetchedAt = System.currentTimeMillis(),
+                                serverCount = marked.size
+                            )
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private fun parseIntervalMillis(label: String): Long {
+        val lower = label.lowercase()
+        val num = Regex("\\d+").find(lower)?.value?.toLongOrNull() ?: 1L
+        return if (lower.contains("min")) {
+            num * 60_000L
+        } else {
+            num * 3_600_000L
+        }
+    }
+
     /**
-     * Reads real Android OS TrafficStats TX/RX counters while connected.
+     * Reads real Android OS TrafficStats TX/RX counters for this VPN UID while connected.
      */
     private fun startRealTrafficTelemetryLoop() {
         timerJob?.cancel()
@@ -259,12 +347,12 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             while (true) {
                 delay(1000L)
                 if (_telemetry.value.isConnected && !_telemetry.value.isConnecting) {
-                    val currentTx = safeTrafficStat { TrafficStats.getTotalTxBytes() }
-                    val currentRx = safeTrafficStat { TrafficStats.getTotalRxBytes() }
-                    val deltaTx = if (baselineTxBytes > 0 && currentTx >= baselineTxBytes) {
+                    val currentTx = readAppTxBytes()
+                    val currentRx = readAppRxBytes()
+                    val deltaTx = if (baselineTxBytes >= 0 && currentTx >= baselineTxBytes) {
                         currentTx - baselineTxBytes
                     } else 0L
-                    val deltaRx = if (baselineRxBytes > 0 && currentRx >= baselineRxBytes) {
+                    val deltaRx = if (baselineRxBytes >= 0 && currentRx >= baselineRxBytes) {
                         currentRx - baselineRxBytes
                     } else 0L
 
@@ -278,6 +366,16 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
+    }
+
+    private fun readAppTxBytes(): Long {
+        val uidTx = safeTrafficStat { TrafficStats.getUidTxBytes(android.os.Process.myUid()) }
+        return if (uidTx > 0L) uidTx else safeTrafficStat { TrafficStats.getTotalTxBytes() }
+    }
+
+    private fun readAppRxBytes(): Long {
+        val uidRx = safeTrafficStat { TrafficStats.getUidRxBytes(android.os.Process.myUid()) }
+        return if (uidRx > 0L) uidRx else safeTrafficStat { TrafficStats.getTotalRxBytes() }
     }
 
     private fun safeTrafficStat(block: () -> Long): Long {
@@ -335,6 +433,11 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun toggleConnection() {
+        if (_telemetry.value.isConnecting) {
+            _telemetry.update { it.copy(isConnecting = false, isConnected = false) }
+            stopAndroidVpnService()
+            return
+        }
         val currentlyConnected = _telemetry.value.isConnected
         if (currentlyConnected) {
             _telemetry.update {
@@ -363,8 +466,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private suspend fun connectToServer(server: ServerEntity) {
-        // Never claim Connected if Android OS VPN consent hasn't been granted yet
-        if (android.net.VpnService.prepare(getApplication()) != null) {
+        // Never claim Connected if Android OS VPN consent hasn't been granted yet (when TUN Mode is on)
+        if (_settings.value.tunMode && android.net.VpnService.prepare(getApplication()) != null) {
             _telemetry.update { it.copy(isConnecting = false, isConnected = false) }
             showMessage("Tap Connect and accept the Android VPN prompt to start the tunnel")
             return
@@ -679,8 +782,9 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             )
             val assetPath = (app.getExternalFilesDir("assets") ?: app.getDir("assets", 0)).absolutePath
             Libv2ray.initCoreEnv(assetPath, deviceId)
-            val config = server.rawConfigJson.ifBlank { fletcher.generateXrayJsonForServer(server) }
-            val delay = Libv2ray.measureOutboundDelay(config, "https://www.gstatic.com/generate_204")
+            val baseConfig = server.rawConfigJson.ifBlank { fletcher.generateXrayJsonForServer(server) }
+            val runtimeConfig = fletcher.applyRuntimeSettingsToXrayJson(baseConfig, _settings.value)
+            val delay = Libv2ray.measureOutboundDelay(runtimeConfig, "https://www.gstatic.com/generate_204")
             if (delay > 0L) delay.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
             else fletcher.measureRealTcpLatencyOrNull(server.host, server.port, 1800)
         } catch (_: Throwable) {
@@ -774,7 +878,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         try {
             val ctx = getApplication<Application>()
             val currentSettings = _settings.value
-            val xrayJson = server.rawConfigJson.ifBlank { fletcher.generateXrayJsonForServer(server) }
+            val baseJson = server.rawConfigJson.ifBlank { fletcher.generateXrayJsonForServer(server) }
+            val xrayJson = fletcher.applyRuntimeSettingsToXrayJson(baseJson, currentSettings)
             val intent = Intent(ctx, XrayVpnService::class.java).apply {
                 action = XrayVpnService.ACTION_CONNECT
                 putExtra(XrayVpnService.EXTRA_SERVER_COUNTRY, server.countryName)
@@ -782,6 +887,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 putExtra(XrayVpnService.EXTRA_SERVER_PORT, server.port)
                 putExtra(XrayVpnService.EXTRA_SERVER_PROTOCOL, server.protocolCore)
                 putExtra(XrayVpnService.EXTRA_XRAY_JSON, xrayJson)
+                putExtra(XrayVpnService.EXTRA_TUN_MODE, currentSettings.tunMode)
                 putExtra(XrayVpnService.EXTRA_ENABLE_IPV6, currentSettings.ipv6Enabled)
                 putExtra(XrayVpnService.EXTRA_DNS_MODE, currentSettings.dnsMode)
                 putExtra(XrayVpnService.EXTRA_ROUTING_MODE, currentSettings.routingMode)

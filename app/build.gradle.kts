@@ -1,4 +1,6 @@
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
+import java.net.HttpURLConnection
+import java.net.URI
 
 plugins {
   alias(libs.plugins.android.application)
@@ -86,6 +88,47 @@ secrets {
 
 googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }
 
+val libV2rayFile = layout.projectDirectory.file("libs/libv2ray.aar").asFile
+if (!libV2rayFile.exists() || libV2rayFile.length() < 1024L) {
+  libV2rayFile.parentFile.mkdirs()
+  val releaseUrl = "https://github.com/2dust/AndroidLibXrayLite/releases/download/v26.10.31/libv2ray.aar"
+  logger.lifecycle("Downloading libv2ray.aar (v26.10.31) from $releaseUrl ...")
+  var currentUrl = releaseUrl
+  var connection: HttpURLConnection
+  var hops = 0
+  while (true) {
+    connection = (URI(currentUrl).toURL().openConnection() as HttpURLConnection).apply {
+      instanceFollowRedirects = false
+      connectTimeout = 15_000
+      readTimeout = 60_000
+      setRequestProperty("User-Agent", "HollowVPN-Gradle/1.0")
+    }
+    val code = connection.responseCode
+    if (code in 300..399 && hops < 6) {
+      val next = connection.getHeaderField("Location") ?: error("Redirect without Location header for $currentUrl")
+      connection.disconnect()
+      currentUrl = URI(currentUrl).resolve(next).toString()
+      hops++
+    } else {
+      break
+    }
+  }
+  if (connection.responseCode !in 200..299) {
+    val msg = "Failed to download libv2ray.aar (HTTP ${connection.responseCode})"
+    connection.disconnect()
+    error(msg)
+  }
+  val tempFile = file("${libV2rayFile.absolutePath}.tmp")
+  connection.inputStream.use { input ->
+    tempFile.outputStream().use { output -> input.copyTo(output) }
+  }
+  connection.disconnect()
+  if (!tempFile.renameTo(libV2rayFile)) {
+    tempFile.copyTo(libV2rayFile, overwrite = true)
+    tempFile.delete()
+  }
+}
+
 dependencies {
   implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar", "*.aar"))))
   implementation(platform(libs.androidx.compose.bom))
@@ -102,6 +145,11 @@ dependencies {
   implementation(libs.androidx.lifecycle.viewmodel.compose)
   implementation(libs.androidx.room.ktx)
   implementation(libs.androidx.room.runtime)
+  implementation(libs.androidx.camera.core)
+  implementation(libs.androidx.camera.camera2)
+  implementation(libs.androidx.camera.lifecycle)
+  implementation(libs.androidx.camera.view)
+  implementation(libs.zxing.core)
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)
   implementation(libs.okhttp)

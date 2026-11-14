@@ -45,11 +45,28 @@ jobs:
               -dname "CN=Hollow VPN Release,O=Hollow VPN,C=US"
           fi
 
+      - name: Cache libv2ray.aar (AndroidLibXrayLite v26.10.31)
+        id: cache-libv2ray
+        uses: actions/cache@v4
+        with:
+          path: app/libs/libv2ray.aar
+          key: libv2ray-aar-v26.10.31
+
+      - name: Download libv2ray.aar if missing
+        if: steps.cache-libv2ray.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p app/libs
+          curl -fSL --retry 3 -o app/libs/libv2ray.aar \
+            "https://github.com/2dust/AndroidLibXrayLite/releases/download/v26.10.31/libv2ray.aar"
+
       - name: Ensure .env file exists
         run: |
           if [ ! -f ".env" ] && [ -f ".env.example" ]; then
             cp .env.example .env
           fi
+
+      - name: Run unit and Robolectric tests
+        run: gradle testDebugUnitTest --stacktrace
 
       - name: Build v7a, arm64-v8a, and universal release APKs
         env:

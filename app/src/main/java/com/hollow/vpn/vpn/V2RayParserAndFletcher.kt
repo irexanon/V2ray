@@ -603,6 +603,20 @@ class V2RayParserAndFletcher {
         }
     }
 
+    private data class TransportBuildParams(
+        val security: String = "",
+        val network: String = "",
+        val wsPath: String = "",
+        val wsHost: String = "",
+        val grpcServiceName: String = "",
+        val fingerprint: String = "chrome",
+        val shortId: String = "",
+        val spiderX: String = "",
+        val flow: String = "",
+        val alpn: List<String> = emptyList(),
+        val allowInsecure: Boolean = false
+    )
+
     private fun parseVmessUri(
         uriLine: String,
         subscriptionUrl: String,
@@ -621,14 +635,34 @@ class V2RayParserAndFletcher {
             if (uuid.isBlank()) return null
             val net = json.optString("net", "tcp").lowercase()
             val tls = json.optString("tls", "").lowercase()
-            val sni = json.optString("sni").ifBlank { json.optString("host", "") }
+            val hostHeader = json.optString("host", "").trim()
+            val path = json.optString("path", "").trim()
+            val sni = json.optString("sni").ifBlank { hostHeader }.trim()
+            val fp = json.optString("fp", "chrome").ifBlank { "chrome" }
+            val alpn = json.optString("alpn", "")
+                .split(",")
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
             val ps = json.optString("ps").ifBlank { host }
 
-            val transportLabel = when (net) {
-                "ws", "websocket" -> "WebSocket"
+            val normalizedNetwork = when (net) {
+                "ws", "websocket" -> "ws"
+                "grpc" -> "grpc"
+                "h2", "http" -> "h2"
+                "httpupgrade" -> "httpupgrade"
+                else -> "tcp"
+            }
+            val transportLabel = when (normalizedNetwork) {
+                "ws" -> "WebSocket"
                 "grpc" -> "gRPC"
-                "h2", "http" -> "HTTP/2"
+                "h2" -> "HTTP/2"
+                "httpupgrade" -> "WebSocket"
                 else -> if (tls == "reality") "Reality" else "TCP"
+            }
+            val securityValue = when (tls) {
+                "reality" -> "reality"
+                "tls" -> "tls"
+                else -> "none"
             }
             val (countryName, countryCode) = inferCountryFromRemarkOrHost("$ps $sni", host)
 
@@ -648,7 +682,17 @@ class V2RayParserAndFletcher {
                 isCustom = isCustom,
                 subscriptionUrl = subscriptionUrl
             )
-            entity.copy(rawConfigJson = generateXrayJsonForServer(entity))
+            val params = TransportBuildParams(
+                security = securityValue,
+                network = normalizedNetwork,
+                wsPath = path,
+                wsHost = hostHeader,
+                grpcServiceName = if (normalizedNetwork == "grpc") path else "",
+                fingerprint = fp,
+                alpn = alpn,
+                allowInsecure = json.optString("skip-cert-verify") == "true" || json.optBoolean("allowInsecure", false)
+            )
+            entity.copy(rawConfigJson = generateXrayJsonForServer(entity, params))
         } catch (_: Exception) {
             null
         }
@@ -681,15 +725,45 @@ class V2RayParserAndFletcher {
             if (host.isBlank() || host.contains(" ")) return null
 
             val queryParams = parseQueryParams(rawQuery)
-            val security = queryParams["security"]?.lowercase().orEmpty()
-            val type = (queryParams["type"] ?: queryParams["net"])?.lowercase().orEmpty()
-            val sni = queryParams["sni"] ?: queryParams["peer"] ?: queryParams["host"] ?: ""
-            val pbk = queryParams["pbk"].orEmpty()
+            val rawSecurity = queryParams["security"]?.lowercase().orEmpty()
+            val rawType = (queryParams["type"] ?: queryParams["net"])?.lowercase().orEmpty()
+            val hostHeader = queryParams["host"].orEmpty().trim()
+            val sni = (queryParams["sni"] ?: queryParams["peer"] ?: queryParams["host"] ?: "").trim()
+            val pbk = queryParams["pbk"].orEmpty().trim()
+            val wsPath = queryParams["path"].orEmpty().trim()
+            val grpcServiceName = queryParams["serviceName"].orEmpty().trim()
+            val fp = queryParams["fp"].orEmpty().ifBlank { "chrome" }
+            val sid = queryParams["sid"].orEmpty().trim()
+            val spx = queryParams["spx"].orEmpty().trim()
+            val flow = queryParams["flow"].orEmpty().trim()
+            val alpn = queryParams["alpn"]
+                ?.split(",")
+                ?.map { it.trim() }
+                ?.filter { it.isNotEmpty() }
+                .orEmpty()
+            val allowInsecure = queryParams["allowInsecure"] == "1" ||
+                queryParams["allowInsecure"].equals("true", ignoreCase = true)
+
+            val normalizedNetwork = when (rawType) {
+                "ws", "websocket" -> "ws"
+                "httpupgrade" -> "httpupgrade"
+                "grpc" -> "grpc"
+                "h2", "http" -> "h2"
+                else -> "tcp"
+            }
+            val resolvedSecurity = when {
+                rawSecurity == "reality" || pbk.isNotBlank() -> "reality"
+                rawSecurity == "tls" -> "tls"
+                rawSecurity == "none" -> "none"
+                protocolName.equals("Trojan", ignoreCase = true) -> "tls"
+                else -> "none"
+            }
 
             val transportLabel = when {
-                security == "reality" || pbk.isNotBlank() -> "Reality"
-                type == "grpc" -> "gRPC"
-                type == "ws" || type == "websocket" || type == "httpupgrade" -> "WebSocket"
+                resolvedSecurity == "reality" -> "Reality"
+                normalizedNetwork == "grpc" -> "gRPC"
+                normalizedNetwork == "ws" || normalizedNetwork == "httpupgrade" -> "WebSocket"
+                normalizedNetwork == "h2" -> "HTTP/2"
                 protocolName.equals("Trojan", ignoreCase = true) -> "Trojan"
                 protocolName.equals("VLESS", ignoreCase = true) -> "VLESS"
                 else -> "TCP"
@@ -714,7 +788,20 @@ class V2RayParserAndFletcher {
                 isCustom = isCustom,
                 subscriptionUrl = subscriptionUrl
             )
-            entity.copy(rawConfigJson = generateXrayJsonForServer(entity))
+            val params = TransportBuildParams(
+                security = resolvedSecurity,
+                network = normalizedNetwork,
+                wsPath = wsPath,
+                wsHost = hostHeader,
+                grpcServiceName = grpcServiceName,
+                fingerprint = fp,
+                shortId = sid,
+                spiderX = spx,
+                flow = flow,
+                alpn = alpn,
+                allowInsecure = allowInsecure
+            )
+            entity.copy(rawConfigJson = generateXrayJsonForServer(entity, params))
         } catch (_: Exception) {
             null
         }
@@ -739,7 +826,7 @@ class V2RayParserAndFletcher {
                 "${tryDecodeBase64(userPart) ?: userPart}@$hostPart"
             }
             if (!decodedMain.contains("@")) return null
-            val userInfo = decodedMain.substringBeforeLast("@").trim()
+            val userInfo = safeUrlDecode(decodedMain.substringBeforeLast("@")).trim()
             val hostPort = decodedMain.substringAfterLast("@").trim()
             val (host, port) = extractHostAndPort(hostPort, defaultPort = 8388)
             if (host.isBlank() || host.contains(" ")) return null
@@ -760,7 +847,8 @@ class V2RayParserAndFletcher {
                 isCustom = isCustom,
                 subscriptionUrl = subscriptionUrl
             )
-            entity.copy(rawConfigJson = generateXrayJsonForServer(entity))
+            val params = TransportBuildParams(security = "none", network = "tcp")
+            entity.copy(rawConfigJson = generateXrayJsonForServer(entity, params))
         } catch (_: Exception) {
             null
         }
@@ -913,6 +1001,13 @@ class V2RayParserAndFletcher {
     }
 
     fun generateXrayJsonForServer(server: ServerEntity): String {
+        return generateXrayJsonForServer(server, params = null)
+    }
+
+    private fun generateXrayJsonForServer(
+        server: ServerEntity,
+        params: TransportBuildParams?
+    ): String {
         if (server.rawConfigJson.isNotBlank()) return server.rawConfigJson
         val protocolLower = when {
             server.protocolCore.contains("VMess", ignoreCase = true) -> "vmess"
@@ -920,84 +1015,372 @@ class V2RayParserAndFletcher {
             server.protocolCore.contains("Shadowsocks", ignoreCase = true) -> "shadowsocks"
             else -> "vless"
         }
-        val networkLower = when (server.transport.lowercase()) {
+        val networkLower = params?.network?.ifBlank { null } ?: when (server.transport.lowercase()) {
             "websocket", "ws" -> "ws"
             "grpc" -> "grpc"
+            "http/2", "h2" -> "h2"
             else -> "tcp"
         }
-        val securityLower = if (server.transport.equals("Reality", ignoreCase = true)) "reality" else "tls"
-
-        return """
-{
-  "log": {
-    "loglevel": "warning"
-  },
-  "inbounds": [
-    {
-      "tag": "socks-in",
-      "port": 10808,
-      "listen": "127.0.0.1",
-      "protocol": "socks",
-      "settings": {
-        "auth": "noauth",
-        "udp": true
-      }
-    },
-    {
-      "tag": "tun-in",
-      "protocol": "tun",
-      "settings": {
-        "name": "xray0",
-        "MTU": 1500,
-        "userLevel": 8
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http", "tls", "quic"]
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "tag": "proxy",
-      "protocol": "$protocolLower",
-      "settings": {
-        "vnext": [
-          {
-            "address": "${server.host}",
-            "port": ${server.port},
-            "users": [
-              {
-                "id": "${server.uuidOrPassword}",
-                "encryption": "none",
-                "flow": "${if (securityLower == "reality") "xtls-rprx-vision" else ""}"
-              }
-            ]
-          }
-        ]
-      },
-      "streamSettings": {
-        "network": "$networkLower",
-        "security": "$securityLower",
-        "tlsSettings": {
-          "serverName": "${server.sni.ifBlank { server.host }}",
-          "allowInsecure": false
-        },
-        "realitySettings": {
-          "serverName": "${server.sni.ifBlank { server.host }}",
-          "fingerprint": "chrome",
-          "publicKey": "${server.publicKey}",
-          "shortId": ""
+        val securityLower = params?.security?.ifBlank { null } ?: when {
+            server.transport.equals("Reality", ignoreCase = true) || server.publicKey.isNotBlank() -> "reality"
+            protocolLower == "shadowsocks" -> "none"
+            protocolLower == "trojan" -> "tls"
+            server.sni.isNotBlank() -> "tls"
+            else -> "none"
         }
-      }
-    },
-    {
-      "tag": "direct",
-      "protocol": "freedom"
+
+        val inbounds = JSONArray()
+            .put(
+                JSONObject()
+                    .put("tag", "socks-in")
+                    .put("port", 10808)
+                    .put("listen", "127.0.0.1")
+                    .put("protocol", "socks")
+                    .put("settings", JSONObject().put("auth", "noauth").put("udp", true))
+            )
+            .put(
+                JSONObject()
+                    .put("tag", "tun-in")
+                    .put("protocol", "tun")
+                    .put("settings", JSONObject().put("name", "xray0").put("MTU", 1500).put("userLevel", 8))
+                    .put(
+                        "sniffing",
+                        JSONObject()
+                            .put("enabled", true)
+                            .put("destOverride", JSONArray().put("http").put("tls").put("quic"))
+                    )
+            )
+
+        val outboundSettings = JSONObject()
+        when (protocolLower) {
+            "shadowsocks" -> {
+                val method = server.uuidOrPassword.substringBefore(":").ifBlank { "aes-256-gcm" }
+                val password = if (server.uuidOrPassword.contains(":")) {
+                    server.uuidOrPassword.substringAfter(":")
+                } else {
+                    server.uuidOrPassword
+                }
+                outboundSettings.put(
+                    "servers",
+                    JSONArray().put(
+                        JSONObject()
+                            .put("address", server.host)
+                            .put("port", server.port)
+                            .put("method", method)
+                            .put("password", password)
+                    )
+                )
+            }
+            "trojan" -> {
+                outboundSettings.put(
+                    "servers",
+                    JSONArray().put(
+                        JSONObject()
+                            .put("address", server.host)
+                            .put("port", server.port)
+                            .put("password", server.uuidOrPassword)
+                    )
+                )
+            }
+            "vmess" -> {
+                val userObj = JSONObject()
+                    .put("id", server.uuidOrPassword)
+                    .put("alterId", 0)
+                    .put("security", "auto")
+                outboundSettings.put(
+                    "vnext",
+                    JSONArray().put(
+                        JSONObject()
+                            .put("address", server.host)
+                            .put("port", server.port)
+                            .put("users", JSONArray().put(userObj))
+                    )
+                )
+            }
+            else -> {
+                val flowValue = params?.flow
+                    ?: if (securityLower == "reality" && networkLower == "tcp") "xtls-rprx-vision" else ""
+                val userObj = JSONObject()
+                    .put("id", server.uuidOrPassword)
+                    .put("encryption", "none")
+                if (flowValue.isNotBlank()) {
+                    userObj.put("flow", flowValue)
+                }
+                outboundSettings.put(
+                    "vnext",
+                    JSONArray().put(
+                        JSONObject()
+                            .put("address", server.host)
+                            .put("port", server.port)
+                            .put("users", JSONArray().put(userObj))
+                    )
+                )
+            }
+        }
+
+        val streamSettings = JSONObject()
+            .put("network", networkLower)
+            .put("security", securityLower)
+
+        val effectiveSni = server.sni.ifBlank { params?.wsHost.orEmpty() }.ifBlank { server.host }
+        when (securityLower) {
+            "reality" -> {
+                val realityObj = JSONObject()
+                    .put("serverName", effectiveSni)
+                    .put("fingerprint", params?.fingerprint?.ifBlank { "chrome" } ?: "chrome")
+                    .put("publicKey", server.publicKey)
+                    .put("shortId", params?.shortId.orEmpty())
+                if (!params?.spiderX.isNullOrBlank()) {
+                    realityObj.put("spiderX", params?.spiderX)
+                }
+                streamSettings.put("realitySettings", realityObj)
+            }
+            "tls" -> {
+                val tlsObj = JSONObject()
+                    .put("serverName", effectiveSni)
+                    .put("allowInsecure", params?.allowInsecure ?: false)
+                if (!params?.fingerprint.isNullOrBlank()) {
+                    tlsObj.put("fingerprint", params?.fingerprint)
+                }
+                if (!params?.alpn.isNullOrEmpty()) {
+                    tlsObj.put("alpn", JSONArray(params?.alpn))
+                }
+                streamSettings.put("tlsSettings", tlsObj)
+            }
+        }
+
+        when (networkLower) {
+            "ws" -> {
+                val wsObj = JSONObject()
+                    .put("path", params?.wsPath?.ifBlank { "/" } ?: "/")
+                val hostHeader = params?.wsHost?.ifBlank { server.sni }.orEmpty()
+                if (hostHeader.isNotBlank()) {
+                    wsObj.put("headers", JSONObject().put("Host", hostHeader))
+                }
+                streamSettings.put("wsSettings", wsObj)
+            }
+            "httpupgrade" -> {
+                val huObj = JSONObject()
+                    .put("path", params?.wsPath?.ifBlank { "/" } ?: "/")
+                val hostHeader = params?.wsHost?.ifBlank { server.sni }.orEmpty()
+                if (hostHeader.isNotBlank()) {
+                    huObj.put("host", hostHeader)
+                }
+                streamSettings.put("httpupgradeSettings", huObj)
+            }
+            "grpc" -> {
+                streamSettings.put(
+                    "grpcSettings",
+                    JSONObject()
+                        .put("serviceName", params?.grpcServiceName.orEmpty())
+                        .put("multiMode", false)
+                )
+            }
+            "h2" -> {
+                val h2Obj = JSONObject()
+                    .put("path", params?.wsPath?.ifBlank { "/" } ?: "/")
+                val hostHeader = params?.wsHost?.ifBlank { server.sni }.orEmpty()
+                if (hostHeader.isNotBlank()) {
+                    h2Obj.put("host", JSONArray().put(hostHeader))
+                }
+                streamSettings.put("httpSettings", h2Obj)
+            }
+        }
+
+        val proxyOutbound = JSONObject()
+            .put("tag", "proxy")
+            .put("protocol", protocolLower)
+            .put("settings", outboundSettings)
+            .put("streamSettings", streamSettings)
+
+        val root = JSONObject()
+            .put("log", JSONObject().put("loglevel", "warning"))
+            .put("inbounds", inbounds)
+            .put(
+                "outbounds",
+                JSONArray()
+                    .put(proxyOutbound)
+                    .put(JSONObject().put("tag", "direct").put("protocol", "freedom"))
+                    .put(JSONObject().put("tag", "block").put("protocol", "blackhole"))
+            )
+
+        return root.toString(2)
     }
-  ]
-}
-        """.trimIndent()
+
+    /**
+     * Applies user DNS, Routing Mode (CIDR-only since geoip.dat/geosite.dat are omitted in Lite AAR),
+     * IPv6 strategy, TUN vs local proxy inbounds, and Xray traffic stats policy to any Xray config JSON.
+     */
+    fun applyRuntimeSettingsToXrayJson(
+        baseJson: String,
+        settings: AppSettingsState
+    ): String {
+        return try {
+            val root = JSONObject(baseJson)
+
+            // 1. Inbounds: keep tun-in when TUN Mode is enabled; otherwise expose SOCKS5 + HTTP proxy
+            val existingInbounds = root.optJSONArray("inbounds") ?: JSONArray()
+            val updatedInbounds = JSONArray()
+            var hasSocks = false
+            var hasTun = false
+            var hasHttp = false
+            for (i in 0 until existingInbounds.length()) {
+                val inbound = existingInbounds.optJSONObject(i) ?: continue
+                val proto = inbound.optString("protocol", "").lowercase()
+                if (proto == "tun") {
+                    if (settings.tunMode) {
+                        updatedInbounds.put(inbound)
+                        hasTun = true
+                    }
+                } else {
+                    if (proto == "socks") hasSocks = true
+                    if (proto == "http") hasHttp = true
+                    updatedInbounds.put(inbound)
+                }
+            }
+            if (!hasSocks) {
+                updatedInbounds.put(
+                    JSONObject()
+                        .put("tag", "socks-in")
+                        .put("port", 10808)
+                        .put("listen", "127.0.0.1")
+                        .put("protocol", "socks")
+                        .put("settings", JSONObject().put("auth", "noauth").put("udp", true))
+                )
+            }
+            if (!settings.tunMode && !hasHttp) {
+                updatedInbounds.put(
+                    JSONObject()
+                        .put("tag", "http-in")
+                        .put("port", 10809)
+                        .put("listen", "127.0.0.1")
+                        .put("protocol", "http")
+                        .put("settings", JSONObject().put("allowTransparent", false))
+                )
+            }
+            if (settings.tunMode && !hasTun) {
+                updatedInbounds.put(
+                    JSONObject()
+                        .put("tag", "tun-in")
+                        .put("protocol", "tun")
+                        .put("settings", JSONObject().put("name", "xray0").put("MTU", 1500).put("userLevel", 8))
+                        .put(
+                            "sniffing",
+                            JSONObject()
+                                .put("enabled", true)
+                                .put("destOverride", JSONArray().put("http").put("tls").put("quic"))
+                        )
+                )
+            }
+            root.put("inbounds", updatedInbounds)
+
+            // 2. Ensure "direct" freedom outbound exists for bypass/direct routing rules
+            val outbounds = root.optJSONArray("outbounds") ?: JSONArray()
+            val hasDirect = (0 until outbounds.length()).any {
+                outbounds.optJSONObject(it)?.optString("tag") == "direct"
+            }
+            if (!hasDirect) {
+                outbounds.put(JSONObject().put("tag", "direct").put("protocol", "freedom"))
+            }
+            root.put("outbounds", outbounds)
+
+            // 3. DNS configuration matching user's DNS setting & IPv6 preference
+            val dnsServers = JSONArray()
+            when {
+                settings.dnsMode.contains("8.8.8.8") -> {
+                    dnsServers.put("8.8.8.8").put("8.8.4.4")
+                }
+                settings.dnsMode.contains("9.9.9.9") -> {
+                    dnsServers.put("9.9.9.9").put("149.112.112.112")
+                }
+                settings.dnsMode.contains("94.140.14.14") -> {
+                    dnsServers.put("94.140.14.14").put("94.140.15.15")
+                }
+                settings.dnsMode.contains("1.1.1.1") -> {
+                    dnsServers.put("1.1.1.1").put("1.0.0.1")
+                }
+                else -> {
+                    dnsServers.put("https+local://1.1.1.1/dns-query").put("1.1.1.1").put("8.8.8.8")
+                }
+            }
+            root.put(
+                "dns",
+                JSONObject()
+                    .put("servers", dnsServers)
+                    .put("queryStrategy", if (settings.ipv6Enabled) "UseIP" else "UseIPv4")
+            )
+
+            // 4. Routing rules (strictly CIDR/network-based — no geoip/geosite files required)
+            val rules = JSONArray()
+            when {
+                settings.routingMode.contains("Direct Only", ignoreCase = true) -> {
+                    rules.put(
+                        JSONObject()
+                            .put("type", "field")
+                            .put("network", "tcp,udp")
+                            .put("outboundTag", "direct")
+                    )
+                }
+                settings.routingMode.contains("Bypass LAN", ignoreCase = true) -> {
+                    rules.put(
+                        JSONObject()
+                            .put("type", "field")
+                            .put(
+                                "ip",
+                                JSONArray()
+                                    .put("10.0.0.0/8")
+                                    .put("172.16.0.0/12")
+                                    .put("192.168.0.0/16")
+                                    .put("127.0.0.0/8")
+                                    .put("169.254.0.0/16")
+                                    .put("224.0.0.0/4")
+                                    .put("fc00::/7")
+                                    .put("fe80::/10")
+                                    .put("ff00::/8")
+                            )
+                            .put("outboundTag", "direct")
+                    )
+                }
+            }
+            root.put(
+                "routing",
+                JSONObject()
+                    .put("domainStrategy", "AsIs")
+                    .put("rules", rules)
+            )
+
+            // 5. Enable Xray internal outbound stats
+            if (!root.has("stats")) {
+                root.put("stats", JSONObject())
+            }
+            if (!root.has("policy")) {
+                root.put(
+                    "policy",
+                    JSONObject()
+                        .put(
+                            "levels",
+                            JSONObject().put(
+                                "8",
+                                JSONObject()
+                                    .put("connIdle", 300)
+                                    .put("downlinkOnly", 1)
+                                    .put("handshake", 4)
+                                    .put("uplinkOnly", 1)
+                            )
+                        )
+                        .put(
+                            "system",
+                            JSONObject()
+                                .put("statsOutboundDownlink", true)
+                                .put("statsOutboundUplink", true)
+                        )
+                )
+            }
+
+            root.toString(2)
+        } catch (_: Exception) {
+            baseJson
+        }
     }
 
     private fun parseQueryParams(rawQuery: String): Map<String, String> {
