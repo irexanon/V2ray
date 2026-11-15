@@ -190,4 +190,22 @@ class HollowVpnRobolectricTest {
         assertEquals(1, reparsedJson.size)
         assertEquals("fi.example.com", reparsedJson.first().host)
     }
+
+    @Test
+    fun `default subscription url is empty and legacy public list url is cleared`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        assertEquals("", AppSettingsState.DEFAULT_SUBSCRIPTION_URL)
+        assertEquals("", AppSettingsState().activeSubscriptionUrl)
+
+        val prefs = context.getSharedPreferences("v2ray_vpn_prefs", Context.MODE_PRIVATE)
+        prefs.edit()
+            .putString(
+                "active_sub_url",
+                "https://raw.githubusercontent.com/mirrorrepomagic/free-v2ray-public-list/refs/heads/main/V2Ray-Config-By-EbraSha.txt"
+            )
+            .apply()
+
+        val loaded = VpnPreferencesStore(context).loadSettings()
+        assertEquals("", loaded.activeSubscriptionUrl)
+    }
 }

@@ -347,7 +347,8 @@ class V2RayParserAndFletcher {
 
             val finalCode = geoResult?.second
                 ?: explicitCode
-                ?: inferCountryCodeFromHostOrIp(server.sni.ifBlank { server.host }, server.resolvedIp)
+                ?: detectExplicitCountryCode(server.sni.ifBlank { server.host })
+                ?: "XX"
             val finalName = geoResult?.first?.takeIf { it.isNotBlank() }
                 ?: countryNameFromIsoCode(finalCode)
 
@@ -506,7 +507,8 @@ class V2RayParserAndFletcher {
 
         val finalCountryCode = geoPair?.second
             ?: explicitCode
-            ?: inferCountryCodeFromHostOrIp(server.sni.ifBlank { server.host }, ip)
+            ?: detectExplicitCountryCode(server.sni.ifBlank { server.host })
+            ?: "XX"
         val baseCountryName = geoPair?.first?.takeIf { it.isNotBlank() }
             ?: countryNameFromIsoCode(finalCountryCode)
 
@@ -582,6 +584,23 @@ class V2RayParserAndFletcher {
             }
         } catch (_: Exception) {
         }
+        try {
+            val req = Request.Builder()
+                .url("https://api.ip.sb/geoip/$ip")
+                .header("Accept", "application/json")
+                .build()
+            geoHttpClient.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    val json = JSONObject(resp.body?.string().orEmpty())
+                    val code = json.optString("country_code", "").uppercase().trim()
+                    val name = json.optString("country", "").trim()
+                    if (code.length == 2) {
+                        return (name.ifBlank { countryNameFromIsoCode(code) }) to code
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
         return null
     }
 
@@ -630,42 +649,6 @@ class V2RayParserAndFletcher {
                 }
             }
         }
-    }
-
-    /**
-     * Maps hostnames/IPs (including Cloudflare edge IPs when SNI lacks a country tag)
-     * across realistic global edge locations so Cloudflare Anycast nodes don't all collapse into "US".
-     */
-    private fun inferCountryCodeFromHostOrIp(hostOrSni: String, ip: String): String {
-        val explicit = detectExplicitCountryCode(hostOrSni)
-        if (explicit != null) return explicit
-
-        val parts = ip.split(".")
-        val o1 = parts.getOrNull(0)?.toIntOrNull()
-        val o2 = parts.getOrNull(1)?.toIntOrNull() ?: 0
-        val o3 = parts.getOrNull(2)?.toIntOrNull() ?: 0
-
-        if (o1 != null && !isCloudflareAnycastHost(ip)) {
-            return when (o1) {
-                5, 46, 78, 88, 116, 136, 138, 148, 159, 162, 168, 176, 178, 188, 195, 213 -> "DE"
-                37, 85, 89, 91, 94, 95, 109, 185, 193, 194, 212 -> "NL"
-                51, 57, 87, 92, 145, 163, 164 -> "FR"
-                65, 93, 135, 181 -> "FI"
-                80, 81, 82, 86, 90, 146, 217 -> "GB"
-                43, 101, 103, 118, 119, 128, 129, 150, 175 -> "SG"
-                133, 153, 157, 160, 210 -> "JP"
-                15, 24, 99, 142, 144, 192 -> "CA"
-                31, 62, 77, 179, 190 -> "CH"
-                79, 83, 84, 151 -> "SE"
-                else -> "US"
-            }
-        }
-
-        // For Cloudflare Anycast edge IPs where the real origin is masked behind CF,
-        // deterministically map by subnet/SNI hash across primary global CF edge hubs
-        val globalHubs = listOf("DE", "SG", "NL", "GB", "FR", "FI", "CA", "JP", "CH", "SE", "US", "AU", "IN")
-        val hashIndex = abs((hostOrSni.hashCode() * 31) + (o2 * 17) + o3) % globalHubs.size
-        return globalHubs[hashIndex]
     }
 
     fun measureRealTcpLatencyOrNull(

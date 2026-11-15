@@ -76,7 +76,8 @@ data class AppSettingsState(
     val selectedAppPackages: Set<String> = emptySet()
 ) {
     companion object {
-        const val DEFAULT_SUBSCRIPTION_URL =
+        const val DEFAULT_SUBSCRIPTION_URL = ""
+        internal const val LEGACY_DEFAULT_SUBSCRIPTION_URL =
             "https://raw.githubusercontent.com/mirrorrepomagic/free-v2ray-public-list/refs/heads/main/V2Ray-Config-By-EbraSha.txt"
     }
 }
@@ -100,6 +101,8 @@ class VpnPreferencesStore(context: Context) {
     private val prefs = context.applicationContext.getSharedPreferences("v2ray_vpn_prefs", Context.MODE_PRIVATE)
 
     fun loadSettings(): AppSettingsState {
+        val rawSubUrl = prefs.getString("active_sub_url", "")?.trim().orEmpty()
+        val cleanSubUrl = if (rawSubUrl == AppSettingsState.LEGACY_DEFAULT_SUBSCRIPTION_URL) "" else rawSubUrl
         return AppSettingsState(
             autoConfigure = prefs.getBoolean("auto_configure", true),
             updateIntervalLabel = prefs.getString("update_interval", "1 hour") ?: "1 hour",
@@ -113,10 +116,7 @@ class VpnPreferencesStore(context: Context) {
             subAutoUpdate = prefs.getBoolean("sub_auto_update", true),
             subUpdateInterval = prefs.getString("sub_update_interval", "1 hour") ?: "1 hour",
             subReplaceExisting = prefs.getBoolean("sub_replace_existing", true),
-            activeSubscriptionUrl = prefs.getString(
-                "active_sub_url",
-                AppSettingsState.DEFAULT_SUBSCRIPTION_URL
-            ) ?: AppSettingsState.DEFAULT_SUBSCRIPTION_URL,
+            activeSubscriptionUrl = cleanSubUrl,
             perAppProxyEnabled = prefs.getBoolean("per_app_proxy", false),
             bypassSelectedApps = prefs.getBoolean("bypass_selected_apps", false),
             selectedAppPackages = prefs.getStringSet("per_app_packages", emptySet()) ?: emptySet()

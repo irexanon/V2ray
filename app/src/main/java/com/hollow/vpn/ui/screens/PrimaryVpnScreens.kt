@@ -649,17 +649,17 @@ fun ConnectedHomeScreen(
     onRefreshRealIp: () -> Unit = {}
 ) {
     val scheme = MaterialTheme.colorScheme
-    val activeCountryName = selectedServer?.countryName ?: "Select Server"
-    val activeCountryCode = selectedServer?.countryCode ?: "DE"
+    val activeCountryName = selectedServer?.countryName ?: "Add Server"
+    val activeCountryCode = selectedServer?.countryCode.orEmpty()
     val activeProtocol = selectedServer?.let {
         formatConsumerProtocol(it.protocolCore, it.transport)
-    } ?: "Auto"
+    } ?: "Not configured"
     val activePingLabel = selectedServer?.let {
         if (it.pingMs > 0) "${it.pingMs} ms" else "Timeout"
     } ?: "—"
     val cleanServerIp = selectedServer?.resolvedIp?.takeIf { it.isNotBlank() }
         ?: selectedServer?.host?.takeIf { it.isNotBlank() }
-        ?: telemetry.serverIpLabel
+        ?: "—"
 
     val statusDotColor by animateColorAsState(
         targetValue = when {
@@ -860,10 +860,19 @@ fun ConnectedHomeScreen(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
-                                CircularCountryFlag(
-                                    countryCode = activeCountryCode,
-                                    size = 22.dp
-                                )
+                                if (activeCountryCode.isNotBlank()) {
+                                    CircularCountryFlag(
+                                        countryCode = activeCountryCode,
+                                        size = 22.dp
+                                    )
+                                } else {
+                                    Icon(
+                                        imageVector = Icons.Outlined.Public,
+                                        contentDescription = null,
+                                        tint = scheme.primary,
+                                        modifier = Modifier.size(22.dp)
+                                    )
+                                }
                                 Text(
                                     text = activeCountryName,
                                     style = MaterialTheme.typography.titleSmall,

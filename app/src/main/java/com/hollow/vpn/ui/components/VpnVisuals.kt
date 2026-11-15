@@ -159,7 +159,7 @@ fun HollowAtmosphereBackground(
     isConnected: Boolean = false,
     isConnecting: Boolean = false,
     showWorldMap: Boolean = false,
-    activeCountryCode: String = "DE",
+    activeCountryCode: String = "",
     content: @Composable BoxScope.() -> Unit
 ) {
     val scheme = MaterialTheme.colorScheme
@@ -228,15 +228,16 @@ fun HollowAtmosphereBackground(
                 val mapW = w * 0.92f
                 val mapH = h * 0.34f
                 val dotRadius = (w * 0.0062f).coerceIn(1.8.dp.toPx(), 3.0.dp.toPx())
-                val targetNorm = countryMapCoordinate(activeCountryCode)
-                val targetCenter = Offset(mapLeft + targetNorm.x * mapW, mapTop + targetNorm.y * mapH)
+                val hasActiveLocation = activeCountryCode.length == 2 && !activeCountryCode.equals("XX", ignoreCase = true)
+                val targetNorm = if (hasActiveLocation) countryMapCoordinate(activeCountryCode) else null
+                val targetCenter = targetNorm?.let { Offset(mapLeft + it.x * mapW, mapTop + it.y * mapH) }
 
                 for (pt in WORLD_DOT_POINTS) {
                     val px = mapLeft + pt.x * mapW
                     val py = mapTop + pt.y * mapH
                     val distToWave = abs(pt.x - sweepProgress)
                     val waveBoost = 1f - (distToWave / 0.16f).coerceIn(0f, 1f)
-                    val nearTarget = hypot(pt.x - targetNorm.x, pt.y - targetNorm.y) < 0.09f
+                    val nearTarget = targetNorm != null && hypot(pt.x - targetNorm.x, pt.y - targetNorm.y) < 0.09f
 
                     val dotColor = when {
                         nearTarget && (isConnected || isConnecting) ->
@@ -251,7 +252,7 @@ fun HollowAtmosphereBackground(
                     )
                 }
 
-                if (isConnected || isConnecting) {
+                if (targetCenter != null && (isConnected || isConnecting)) {
                     val originCenter = Offset(mapLeft + mapW * 0.42f, mapTop + mapH * 0.36f)
                     if (hypot(originCenter.x - targetCenter.x, originCenter.y - targetCenter.y) > 20f) {
                         val ctrl = Offset(
@@ -277,19 +278,21 @@ fun HollowAtmosphereBackground(
                     }
                 }
 
-                val rippleAlpha = (1f - beaconPulse) * if (isConnected || isConnecting) 0.55f else 0.28f
-                val rippleRadius = 6.dp.toPx() + beaconPulse * 24.dp.toPx()
-                drawCircle(
-                    color = auraTint.copy(alpha = rippleAlpha),
-                    radius = rippleRadius,
-                    center = targetCenter,
-                    style = Stroke(width = 1.6.dp.toPx())
-                )
-                drawCircle(
-                    color = auraTint.copy(alpha = if (isConnected || isConnecting) 0.95f else 0.65f),
-                    radius = 4.dp.toPx(),
-                    center = targetCenter
-                )
+                if (targetCenter != null) {
+                    val rippleAlpha = (1f - beaconPulse) * if (isConnected || isConnecting) 0.55f else 0.28f
+                    val rippleRadius = 6.dp.toPx() + beaconPulse * 24.dp.toPx()
+                    drawCircle(
+                        color = auraTint.copy(alpha = rippleAlpha),
+                        radius = rippleRadius,
+                        center = targetCenter,
+                        style = Stroke(width = 1.6.dp.toPx())
+                    )
+                    drawCircle(
+                        color = auraTint.copy(alpha = if (isConnected || isConnecting) 0.95f else 0.65f),
+                        radius = 4.dp.toPx(),
+                        center = targetCenter
+                    )
+                }
             }
         }
         content()
@@ -771,9 +774,26 @@ fun CircularCountryFlag(
                 )
             }
             else -> {
-                drawRect(color = scheme.primary, topLeft = Offset(0f, 0f), size = Size(w, h / 3f))
-                drawRect(color = Color.White, topLeft = Offset(0f, h / 3f), size = Size(w, h / 3f))
-                drawRect(color = scheme.tertiary, topLeft = Offset(0f, 2f * h / 3f), size = Size(w, h / 3f))
+                drawRect(color = scheme.surfaceContainerHigh, size = Size(w, h))
+                val stroke = Stroke(width = (w * 0.065f).coerceAtLeast(1.4f))
+                drawCircle(
+                    color = scheme.primary.copy(alpha = 0.78f),
+                    radius = w * 0.30f,
+                    center = Offset(w / 2f, h / 2f),
+                    style = stroke
+                )
+                drawLine(
+                    color = scheme.primary.copy(alpha = 0.78f),
+                    start = Offset(w * 0.20f, h / 2f),
+                    end = Offset(w * 0.80f, h / 2f),
+                    strokeWidth = stroke.width
+                )
+                drawOval(
+                    color = scheme.primary.copy(alpha = 0.78f),
+                    topLeft = Offset(w * 0.36f, h * 0.20f),
+                    size = Size(w * 0.28f, h * 0.60f),
+                    style = stroke
+                )
             }
         }
         drawCircle(

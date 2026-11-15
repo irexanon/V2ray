@@ -342,9 +342,9 @@ fun CountryServerListScreen(
                                             color = scheme.onSurface
                                         )
                                         val emptyMsg = if (activeProtocolPreference != "Auto (V2Ray)") {
-                                            "No servers match \"${formatConsumerProtocol(activeProtocolPreference)}\". Reset to Auto or refresh."
+                                            "No servers match \"${formatConsumerProtocol(activeProtocolPreference)}\". Reset to Auto or add a server."
                                         } else {
-                                            "No servers cached yet. Refresh to find the fastest nodes."
+                                            "No servers added yet. Import your subscription URL, server link, or QR code."
                                         }
                                         Text(
                                             text = emptyMsg,
@@ -362,10 +362,12 @@ fun CountryServerListScreen(
                                                 }
                                             }
                                             FilledTonalButton(
-                                                onClick = onRefresh,
-                                                modifier = Modifier.minimumInteractiveComponentSize()
+                                                onClick = onOpenAddServer,
+                                                modifier = Modifier
+                                                    .minimumInteractiveComponentSize()
+                                                    .testTag("empty_add_server_button")
                                             ) {
-                                                Text("Refresh List")
+                                                Text("Add Server")
                                             }
                                         }
                                     }

@@ -315,15 +315,19 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * On startup, checks for cached real servers or automatically fetches & ping-ranks the Top 15
-     * live servers from the user's configured subscription URL.
+     * On startup, loads saved servers or refreshes the user's configured subscription URL if Auto Configure is enabled.
+     * Never preloads hardcoded third-party servers when no user subscription is configured.
      */
     private fun initializeLiveServersOnStartup() {
         viewModelScope.launch {
             val existing = dao.getAllServersOnce()
+            val subs = dao.getSubscriptionsOnce()
+            val configuredSubUrl = subs.firstOrNull()?.url?.takeIf { it.isNotBlank() }
+                ?: _settings.value.activeSubscriptionUrl.trim()
             val canAutoConnect = _settings.value.startOnAppOpen &&
                 (!_settings.value.tunMode || android.net.VpnService.prepare(getApplication()) == null)
-            if (existing.isEmpty() || _settings.value.autoConfigure) {
+
+            if (configuredSubUrl.isNotBlank() && (existing.isEmpty() || _settings.value.autoConfigure)) {
                 runFletcherAutoFetchAndPingSweep(
                     returnScreen = VpnScreen.CONNECTED_HOME,
                     autoConnectAfterFetch = canAutoConnect
@@ -331,7 +335,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             } else {
                 _screenStack.value = listOf(VpnScreen.CONNECTED_HOME)
                 _currentScreen.value = VpnScreen.CONNECTED_HOME
-                if (canAutoConnect) {
+                if (existing.isNotEmpty() && canAutoConnect) {
                     val active = existing.firstOrNull { it.isSelected } ?: existing.first()
                     connectToServer(active)
                 }
@@ -465,11 +469,17 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         } else {
             val active = selectedServer.value
             if (active == null) {
-                showMessage("No server available yet — fetching live servers…")
-                runFletcherAutoFetchAndPingSweep(
-                    returnScreen = VpnScreen.CONNECTED_HOME,
-                    autoConnectAfterFetch = true
-                )
+                val configuredSub = _settings.value.activeSubscriptionUrl.trim()
+                if (configuredSub.isNotBlank()) {
+                    showMessage("Fetching servers from your subscription…")
+                    runFletcherAutoFetchAndPingSweep(
+                        returnScreen = VpnScreen.CONNECTED_HOME,
+                        autoConnectAfterFetch = true
+                    )
+                } else {
+                    navigateTo(VpnScreen.ADD_SERVER)
+                    showMessage("Add a subscription URL, server link, or QR code first")
+                }
                 return
             }
             connectJob?.cancel()
@@ -492,7 +502,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
         val isDirectOnly = _settings.value.routingMode.contains("Direct Only", ignoreCase = true)
         val livePing: Int? = if (isDirectOnly) {
-            1
+            server.pingMs
         } else {
             when (val probe = fletcher.measureRealXrayDelayOrNull(getApplication(), server, _settings.value)) {
                 is XrayProbeResult.Success -> probe.delayMs
@@ -536,13 +546,25 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         returnScreen: VpnScreen = VpnScreen.SERVER_LIST,
         autoConnectAfterFetch: Boolean = false
     ) {
-        _currentScreen.value = VpnScreen.SPLASH_FETCHING
         viewModelScope.launch {
-            _fetchingStatusMessage.value = "Auto configuring for you"
-
             val subs = dao.getSubscriptionsOnce()
-            val targetSubUrl = subs.firstOrNull()?.url?.takeIf { it.isNotBlank() }
-                ?: _settings.value.activeSubscriptionUrl
+            val targetSubUrl = (subs.firstOrNull()?.url?.takeIf { it.isNotBlank() }
+                ?: _settings.value.activeSubscriptionUrl).trim()
+
+            if (targetSubUrl.isBlank()) {
+                val existing = dao.getAllServersOnce()
+                if (existing.isNotEmpty()) {
+                    _currentScreen.value = returnScreen
+                    repingAllSavedServers()
+                } else {
+                    navigateTo(VpnScreen.ADD_SERVER)
+                    showMessage("Add a subscription URL, server link, or QR code first")
+                }
+                return@launch
+            }
+
+            _currentScreen.value = VpnScreen.SPLASH_FETCHING
+            _fetchingStatusMessage.value = "Fetching your subscription…"
 
             val subResult = fletcher.fetchSubscriptionAndRankTop15(
                 subscriptionUrl = targetSubUrl,
