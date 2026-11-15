@@ -61,7 +61,8 @@ data class ConnectionTelemetryState(
     val downloadBytesPerSec: Long = 0L,
     val serverIpLabel: String = "—",
     val realPublicIpLabel: String = "Detecting…",
-    val realPublicCountryCode: String = "XX"
+    val realPublicCountryCode: String = "XX",
+    val preConnectionIp: String = ""
 ) {
     val formattedTimer: String
         get() {
@@ -105,8 +106,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private val _settings = MutableStateFlow(prefsStore.loadSettings())
     val settings: StateFlow<AppSettingsState> = _settings.asStateFlow()
 
-    private val _screenStack = MutableStateFlow(listOf(VpnScreen.SPLASH_FETCHING))
-    private val _currentScreen = MutableStateFlow(VpnScreen.SPLASH_FETCHING)
+    private val _screenStack = MutableStateFlow(listOf(VpnScreen.CONNECTED_HOME))
+    private val _currentScreen = MutableStateFlow(VpnScreen.CONNECTED_HOME)
     val currentScreen: StateFlow<VpnScreen> = _currentScreen.asStateFlow()
 
     private val _selectedFilter = MutableStateFlow(ServerFilter.ALL)
@@ -303,20 +304,27 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     fun refreshRealPublicIp() {
         viewModelScope.launch {
+            val wasTunnelActive = _telemetry.value.isConnected || _telemetry.value.isConnecting
             val proxyPort = if (_telemetry.value.isConnected && !_settings.value.tunMode) 10808 else null
             val (ip, country, code) = fletcher.fetchDevicePublicIpInfo(socksProxyPort = proxyPort)
-            _telemetry.update {
-                it.copy(
+            _telemetry.update { prev ->
+                val savedPreIp = if (!wasTunnelActive && ip.isNotBlank() && !ip.equals("Detecting…", ignoreCase = true)) {
+                    ip
+                } else {
+                    prev.preConnectionIp
+                }
+                prev.copy(
                     realPublicIpLabel = "$ip · $country",
-                    realPublicCountryCode = code
+                    realPublicCountryCode = code,
+                    preConnectionIp = savedPreIp
                 )
             }
         }
     }
 
     /**
-     * On startup, loads saved servers or refreshes the user's configured subscription URL if Auto Configure is enabled.
-     * Never preloads hardcoded third-party servers when no user subscription is configured.
+     * On startup, loads saved servers or refreshes the user's configured subscription URL quietly
+     * in the background without blocking the user behind a splash fetching screen.
      */
     private fun initializeLiveServersOnStartup() {
         viewModelScope.launch {
@@ -327,18 +335,18 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             val canAutoConnect = _settings.value.startOnAppOpen &&
                 (!_settings.value.tunMode || android.net.VpnService.prepare(getApplication()) == null)
 
+            _screenStack.value = listOf(VpnScreen.CONNECTED_HOME)
+            _currentScreen.value = VpnScreen.CONNECTED_HOME
+
             if (configuredSubUrl.isNotBlank() && (existing.isEmpty() || _settings.value.autoConfigure)) {
                 runFletcherAutoFetchAndPingSweep(
                     returnScreen = VpnScreen.CONNECTED_HOME,
-                    autoConnectAfterFetch = canAutoConnect
+                    autoConnectAfterFetch = canAutoConnect,
+                    showLoadingScreen = false
                 )
-            } else {
-                _screenStack.value = listOf(VpnScreen.CONNECTED_HOME)
-                _currentScreen.value = VpnScreen.CONNECTED_HOME
-                if (existing.isNotEmpty() && canAutoConnect) {
-                    val active = existing.firstOrNull { it.isSelected } ?: existing.first()
-                    connectToServer(active)
-                }
+            } else if (existing.isNotEmpty() && canAutoConnect) {
+                val active = existing.firstOrNull { it.isSelected } ?: existing.first()
+                connectToServer(active)
             }
         }
     }
@@ -544,7 +552,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
      */
     fun runFletcherAutoFetchAndPingSweep(
         returnScreen: VpnScreen = VpnScreen.SERVER_LIST,
-        autoConnectAfterFetch: Boolean = false
+        autoConnectAfterFetch: Boolean = false,
+        showLoadingScreen: Boolean = false
     ) {
         viewModelScope.launch {
             val subs = dao.getSubscriptionsOnce()
@@ -554,16 +563,20 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             if (targetSubUrl.isBlank()) {
                 val existing = dao.getAllServersOnce()
                 if (existing.isNotEmpty()) {
-                    _currentScreen.value = returnScreen
+                    if (showLoadingScreen) {
+                        _currentScreen.value = returnScreen
+                    }
                     repingAllSavedServers()
-                } else {
+                } else if (showLoadingScreen) {
                     navigateTo(VpnScreen.ADD_SERVER)
                     showMessage("Add a subscription URL, server link, or QR code first")
                 }
                 return@launch
             }
 
-            _currentScreen.value = VpnScreen.SPLASH_FETCHING
+            if (showLoadingScreen) {
+                _currentScreen.value = VpnScreen.SPLASH_FETCHING
+            }
             _fetchingStatusMessage.value = "Fetching your subscription…"
 
             val subResult = fletcher.fetchSubscriptionAndRankTop15(
@@ -585,8 +598,10 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     dao.insertServers(withSelected)
 
-                    _screenStack.value = listOf(VpnScreen.CONNECTED_HOME, returnScreen).distinct()
-                    _currentScreen.value = returnScreen
+                    if (showLoadingScreen) {
+                        _screenStack.value = listOf(VpnScreen.CONNECTED_HOME, returnScreen).distinct()
+                        _currentScreen.value = returnScreen
+                    }
 
                     val fastest = withSelected.firstOrNull()
                     if (autoConnectAfterFetch && fastest != null) {
@@ -618,10 +633,14 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                                 reRanked.mapIndexed { index, srv -> srv.copy(isSelected = index == 0) }
                             )
                         }
-                        _currentScreen.value = returnScreen
+                        if (showLoadingScreen) {
+                            _currentScreen.value = returnScreen
+                        }
                         showMessage("Updated latency for ${reRanked.size} reachable servers")
                     } else {
-                        _currentScreen.value = VpnScreen.ADD_SERVER
+                        if (showLoadingScreen) {
+                            _currentScreen.value = VpnScreen.ADD_SERVER
+                        }
                         showMessage("Fetch failed: ${error.message ?: "Check subscription URL"}")
                     }
                 }
@@ -913,6 +932,47 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             dao.deleteServerById(server.id)
             showMessage("Removed ${server.countryName}")
+        }
+    }
+
+    fun deleteServersByIds(ids: Set<Long>) {
+        if (ids.isEmpty()) return
+        viewModelScope.launch {
+            ids.forEach { dao.deleteServerById(it) }
+            showMessage("Removed ${ids.size} server(s)")
+        }
+    }
+
+    fun deleteDuplicateServers() {
+        viewModelScope.launch {
+            val all = dao.getAllServersOnce()
+            val seen = HashSet<String>()
+            val duplicates = mutableListOf<ServerEntity>()
+            all.sortedByDescending { it.isSelected }
+                .forEach { server ->
+                    val key = "${server.host.lowercase()}:${server.port}:${server.protocolCore.lowercase()}:${server.uuidOrPassword}"
+                    if (!seen.add(key)) {
+                        duplicates += server
+                    }
+                }
+            if (duplicates.isEmpty()) {
+                showMessage("No duplicate servers found")
+            } else {
+                duplicates.forEach { dao.deleteServerById(it.id) }
+                showMessage("Removed ${duplicates.size} duplicate server(s)")
+            }
+        }
+    }
+
+    fun deleteInvalidServers() {
+        viewModelScope.launch {
+            val invalid = dao.getAllServersOnce().filter { it.pingMs <= 0 }
+            if (invalid.isEmpty()) {
+                showMessage("No invalid or unreachable servers found")
+            } else {
+                invalid.forEach { dao.deleteServerById(it.id) }
+                showMessage("Removed ${invalid.size} invalid server(s)")
+            }
         }
     }
 

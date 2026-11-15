@@ -13,7 +13,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.core.content.ContextCompat
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Box
@@ -23,19 +22,15 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Dashboard
 import androidx.compose.material.icons.outlined.Dns
-import androidx.compose.material.icons.rounded.Dashboard
-import androidx.compose.material.icons.rounded.Dns
+import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.rounded.PowerSettingsNew
 import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationRail
 import androidx.compose.material3.NavigationRailItem
+import androidx.compose.material3.NavigationRailItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Snackbar
 import androidx.compose.material3.SnackbarHost
@@ -43,6 +38,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -50,11 +46,16 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.hollow.vpn.ui.VpnScreen
 import com.hollow.vpn.ui.VpnViewModel
+import com.hollow.vpn.ui.components.HollowBottomNavigationBar
+import com.hollow.vpn.ui.components.HollowBottomTab
 import com.hollow.vpn.ui.components.ServerQrShareDialog
 import com.hollow.vpn.ui.screens.AddServerScreen
 import com.hollow.vpn.ui.screens.ConnectedHomeScreen
@@ -62,6 +63,19 @@ import com.hollow.vpn.ui.screens.CountryServerListScreen
 import com.hollow.vpn.ui.screens.RawXrayJsonEditorDialog
 import com.hollow.vpn.ui.screens.SettingsScreen
 import com.hollow.vpn.ui.screens.SplashFetchingScreen
+import com.hollow.vpn.ui.theme.HollowAmber
+import com.hollow.vpn.ui.theme.HollowCream
+import com.hollow.vpn.ui.theme.HollowCreamDivider
+import com.hollow.vpn.ui.theme.HollowForest
+import com.hollow.vpn.ui.theme.HollowForestDivider
+import com.hollow.vpn.ui.theme.HollowForestMuted
+import com.hollow.vpn.ui.theme.HollowInk
+import com.hollow.vpn.ui.theme.HollowInkSecondary
+import com.hollow.vpn.ui.theme.HollowLime
+import com.hollow.vpn.ui.theme.HollowObsidian
+import com.hollow.vpn.ui.theme.HollowObsidianDivider
+import com.hollow.vpn.ui.theme.HollowObsidianMuted
+import com.hollow.vpn.ui.theme.HollowOrange
 import com.hollow.vpn.ui.theme.HollowVpnTheme
 import com.hollow.vpn.vpn.XrayVpnService
 
@@ -81,8 +95,8 @@ class MainActivity : ComponentActivity() {
 fun HollowVpnApp(
     vpnViewModel: VpnViewModel = viewModel()
 ) {
-    val scheme = MaterialTheme.colorScheme
     val context = LocalContext.current
+    val view = LocalView.current
     val currentScreen by vpnViewModel.currentScreen.collectAsStateWithLifecycle()
     val allServers by vpnViewModel.allServers.collectAsStateWithLifecycle()
     val filteredServers by vpnViewModel.filteredServers.collectAsStateWithLifecycle()
@@ -98,6 +112,16 @@ fun HollowVpnApp(
     val xrayLogs by XrayVpnService.logs.collectAsStateWithLifecycle()
 
     val snackbarHostState = remember { SnackbarHostState() }
+
+    val isDarkHomePhase = currentScreen == VpnScreen.CONNECTED_HOME &&
+        (telemetry.isConnecting || telemetry.isConnected)
+
+    SideEffect {
+        val window = (view.context as? Activity)?.window ?: return@SideEffect
+        val insetsController = WindowCompat.getInsetsController(window, view)
+        insetsController.isAppearanceLightStatusBars = !isDarkHomePhase
+        insetsController.isAppearanceLightNavigationBars = !isDarkHomePhase
+    }
 
     LaunchedEffect(settings.hideFromRecentApps) {
         try {
@@ -171,40 +195,93 @@ fun HollowVpnApp(
         }
     }
 
-    val showTopLevelNav = currentScreen == VpnScreen.CONNECTED_HOME || currentScreen == VpnScreen.SERVER_LIST
+    val exportServersToClipboard: () -> Unit = {
+        val servers = allServers
+        val payload = vpnViewModel.buildExportBackupPayload(servers)
+        if (payload.isBlank()) {
+            vpnViewModel.showMessage("No saved servers to export")
+        } else {
+            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+            cm?.setPrimaryClip(android.content.ClipData.newPlainText("Hollow VPN Servers", payload))
+            vpnViewModel.showMessage("Exported ${servers.size} server(s) to clipboard")
+        }
+    }
 
-    val navItems = remember {
-        listOf(
-            Triple(VpnScreen.CONNECTED_HOME, Icons.Rounded.Dashboard, Icons.Outlined.Dashboard to "Connect"),
-            Triple(VpnScreen.SERVER_LIST, Icons.Rounded.Dns, Icons.Outlined.Dns to "Servers")
-        )
+    // Bottom navigation is shown on Connect (Pages 1-3), Servers (Pages 4 & 7), and Add Server (Page 5)
+    val showBottomNav = currentScreen == VpnScreen.CONNECTED_HOME ||
+        currentScreen == VpnScreen.SERVER_LIST ||
+        currentScreen == VpnScreen.ADD_SERVER
+
+    val selectedBottomTab = when (currentScreen) {
+        VpnScreen.CONNECTED_HOME -> HollowBottomTab.CONNECT
+        VpnScreen.SERVER_LIST, VpnScreen.ADD_SERVER -> HollowBottomTab.SERVERS
+        VpnScreen.SETTINGS -> HollowBottomTab.SETTINGS
+        VpnScreen.SPLASH_FETCHING -> HollowBottomTab.CONNECT
+    }
+
+    val navBackgroundColor = when {
+        currentScreen == VpnScreen.CONNECTED_HOME && telemetry.isConnecting -> HollowObsidian
+        currentScreen == VpnScreen.CONNECTED_HOME && telemetry.isConnected -> HollowForest
+        else -> HollowCream
+    }
+    val navBorderColor = when {
+        currentScreen == VpnScreen.CONNECTED_HOME && telemetry.isConnecting -> HollowObsidianDivider
+        currentScreen == VpnScreen.CONNECTED_HOME && telemetry.isConnected -> HollowForestDivider
+        else -> HollowCreamDivider
+    }
+    val navIndicatorColor = when {
+        currentScreen == VpnScreen.CONNECTED_HOME && telemetry.isConnecting -> HollowAmber
+        currentScreen == VpnScreen.CONNECTED_HOME && telemetry.isConnected -> HollowLime
+        else -> HollowOrange
+    }
+    val navActiveTextColor = when {
+        currentScreen == VpnScreen.CONNECTED_HOME && (telemetry.isConnecting || telemetry.isConnected) -> HollowCream
+        else -> HollowInk
+    }
+    val navInactiveTextColor = when {
+        currentScreen == VpnScreen.CONNECTED_HOME && telemetry.isConnecting -> HollowObsidianMuted
+        currentScreen == VpnScreen.CONNECTED_HOME && telemetry.isConnected -> HollowForestMuted
+        else -> HollowInkSecondary
     }
 
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-        val useNavigationRail = showTopLevelNav && maxWidth >= 600.dp
+        val useNavigationRail = showBottomNav && maxWidth >= 600.dp
 
         Row(modifier = Modifier.fillMaxSize()) {
             if (useNavigationRail) {
                 NavigationRail(
-                    containerColor = scheme.surfaceContainer,
+                    containerColor = navBackgroundColor,
                     modifier = Modifier.fillMaxHeight()
                 ) {
                     Spacer(Modifier.weight(1f))
-                    navItems.forEach { (screen, activeIcon, inactiveAndLabel) ->
-                        val selected = currentScreen == screen
-                        val (inactiveIcon, label) = inactiveAndLabel
-                        NavigationRailItem(
-                            selected = selected,
-                            onClick = { vpnViewModel.navigateTo(screen) },
-                            icon = {
-                                Icon(
-                                    imageVector = if (selected) activeIcon else inactiveIcon,
-                                    contentDescription = label
-                                )
-                            },
-                            label = { Text(label) }
-                        )
-                    }
+                    val railColors = NavigationRailItemDefaults.colors(
+                        selectedIconColor = navActiveTextColor,
+                        selectedTextColor = navActiveTextColor,
+                        unselectedIconColor = navInactiveTextColor,
+                        unselectedTextColor = navInactiveTextColor,
+                        indicatorColor = navIndicatorColor.copy(alpha = 0.22f)
+                    )
+                    NavigationRailItem(
+                        selected = selectedBottomTab == HollowBottomTab.CONNECT,
+                        onClick = { vpnViewModel.navigateTo(VpnScreen.CONNECTED_HOME) },
+                        icon = { Icon(Icons.Rounded.PowerSettingsNew, contentDescription = "Connect") },
+                        label = { Text("Connect") },
+                        colors = railColors
+                    )
+                    NavigationRailItem(
+                        selected = selectedBottomTab == HollowBottomTab.SERVERS,
+                        onClick = { vpnViewModel.navigateTo(VpnScreen.SERVER_LIST) },
+                        icon = { Icon(Icons.Outlined.Dns, contentDescription = "Servers") },
+                        label = { Text("Servers") },
+                        colors = railColors
+                    )
+                    NavigationRailItem(
+                        selected = selectedBottomTab == HollowBottomTab.SETTINGS,
+                        onClick = { vpnViewModel.navigateTo(VpnScreen.SETTINGS) },
+                        icon = { Icon(Icons.Outlined.Settings, contentDescription = "Settings") },
+                        label = { Text("Settings") },
+                        colors = railColors
+                    )
                     Spacer(Modifier.weight(1f))
                 }
             }
@@ -217,38 +294,25 @@ fun HollowVpnApp(
                     SnackbarHost(hostState = snackbarHostState) { data ->
                         Snackbar(
                             snackbarData = data,
-                            shape = RoundedCornerShape(18.dp),
-                            containerColor = scheme.inverseSurface,
-                            contentColor = scheme.inverseOnSurface
+                            shape = RoundedCornerShape(16.dp),
+                            containerColor = HollowInk,
+                            contentColor = HollowCream
                         )
                     }
                 },
                 bottomBar = {
-                    if (showTopLevelNav && !useNavigationRail) {
-                        NavigationBar(
-                            containerColor = scheme.surfaceContainer
-                        ) {
-                            navItems.forEach { (screen, activeIcon, inactiveAndLabel) ->
-                                val selected = currentScreen == screen
-                                val (inactiveIcon, label) = inactiveAndLabel
-                                NavigationBarItem(
-                                    selected = selected,
-                                    onClick = { vpnViewModel.navigateTo(screen) },
-                                    icon = {
-                                        Icon(
-                                            imageVector = if (selected) activeIcon else inactiveIcon,
-                                            contentDescription = label
-                                        )
-                                    },
-                                    label = {
-                                        Text(
-                                            text = label,
-                                            style = MaterialTheme.typography.labelMedium
-                                        )
-                                    }
-                                )
-                            }
-                        }
+                    if (showBottomNav && !useNavigationRail) {
+                        HollowBottomNavigationBar(
+                            selectedTab = selectedBottomTab,
+                            backgroundColor = navBackgroundColor,
+                            borderColor = navBorderColor,
+                            activeIndicatorColor = navIndicatorColor,
+                            activeContentColor = navActiveTextColor,
+                            inactiveContentColor = navInactiveTextColor,
+                            onSelectConnect = { vpnViewModel.navigateTo(VpnScreen.CONNECTED_HOME) },
+                            onSelectServers = { vpnViewModel.navigateTo(VpnScreen.SERVER_LIST) },
+                            onSelectSettings = { vpnViewModel.navigateTo(VpnScreen.SETTINGS) }
+                        )
                     }
                 }
             ) { innerPadding ->
@@ -313,6 +377,11 @@ fun HollowVpnApp(
                                     onShareQr = vpnViewModel::openQrShare,
                                     onInspectJson = vpnViewModel::openJsonInspector,
                                     onDeleteServer = vpnViewModel::deleteServer,
+                                    onDeleteServersByIds = vpnViewModel::deleteServersByIds,
+                                    onDeleteDuplicates = vpnViewModel::deleteDuplicateServers,
+                                    onDeleteInvalid = vpnViewModel::deleteInvalidServers,
+                                    onExportAllServers = exportServersToClipboard,
+                                    onDeleteAllServers = vpnViewModel::clearServerCacheAndReset,
                                     onBack = {
                                         if (!vpnViewModel.navigateBack()) {
                                             vpnViewModel.navigateTo(VpnScreen.CONNECTED_HOME)
@@ -351,17 +420,7 @@ fun HollowVpnApp(
                                         vpnViewModel.navigateTo(VpnScreen.ADD_SERVER)
                                     },
                                     onClearXrayLogs = vpnViewModel::clearXrayLogs,
-                                    onExportServers = {
-                                        val servers = allServers
-                                        val payload = vpnViewModel.buildExportBackupPayload(servers)
-                                        if (payload.isBlank()) {
-                                            vpnViewModel.showMessage("No saved servers to export")
-                                        } else {
-                                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
-                                            cm?.setPrimaryClip(android.content.ClipData.newPlainText("Hollow VPN Servers", payload))
-                                            vpnViewModel.showMessage("Exported ${servers.size} server(s) to clipboard")
-                                        }
-                                    },
+                                    onExportServers = exportServersToClipboard,
                                     onShowMessage = vpnViewModel::showMessage,
                                     onClearCache = vpnViewModel::clearServerCacheAndReset,
                                     onBack = {
@@ -376,6 +435,7 @@ fun HollowVpnApp(
                                 AddServerScreen(
                                     activeTab = activeAddTab,
                                     settings = settings,
+                                    bottomContentPadding = innerPadding.calculateBottomPadding(),
                                     onSelectTab = vpnViewModel::setAddServerTab,
                                     onAddAndFetchSubscription = vpnViewModel::addAndFetchSubscriptionUrl,
                                     onImportClipboardText = vpnViewModel::importFromTextOrClipboard,
