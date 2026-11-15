@@ -1,8 +1,11 @@
 package com.hollow.vpn.vpn
 
+import android.content.Context
+import android.provider.Settings
 import android.util.Base64
 import com.hollow.vpn.data.AppSettingsState
 import com.hollow.vpn.data.ServerEntity
+import go.Seq
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -10,6 +13,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import libv2ray.Libv2ray
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -18,19 +22,28 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.Proxy
 import java.net.Socket
 import java.net.URLDecoder
+import java.security.MessageDigest
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlin.system.measureTimeMillis
 
+sealed class XrayProbeResult {
+    data class Success(val delayMs: Int) : XrayProbeResult()
+    data object NativeUnavailable : XrayProbeResult()
+    data object Unreachable : XrayProbeResult()
+}
+
 /**
  * Production V2Ray / Xray multi-protocol parser and Fletcher Auto-Fetcher.
  * Fetches live subscriptions, samples across the entire server pool (preventing Cloudflare US
- * anycast dominance), runs parallel TCP socket ping tests, resolves real IPs + batch GeoIP countries,
- * and curates a country-diverse Top 15 fastest server list.
+ * anycast dominance), runs parallel TCP socket + real Xray outbound delay verification,
+ * resolves real IPs + batch GeoIP countries, and curates a country-diverse Top 15 fastest list.
  */
 class V2RayParserAndFletcher {
 
@@ -41,17 +54,30 @@ class V2RayParserAndFletcher {
         .build()
 
     private val geoHttpClient = OkHttpClient.Builder()
-        .connectTimeout(4, TimeUnit.SECONDS)
-        .readTimeout(4, TimeUnit.SECONDS)
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
         .build()
+
+    @Volatile
+    private var coreEnvInitialized = false
+
+    fun evictConnectionPools() {
+        try {
+            httpClient.connectionPool.evictAll()
+            geoHttpClient.connectionPool.evictAll()
+        } catch (_: Exception) {
+        }
+    }
 
     /**
      * Fetches a user-provided V2Ray/Xray subscription URL, decodes all discovered nodes,
-     * samples diverse hosts across the entire list, runs concurrent real TCP handshake latency probes,
+     * samples diverse hosts across the entire list, runs concurrent TCP + real Xray handshake probes,
      * resolves batch GeoIP Country Name/Flag, and returns a country-diverse Top 15 fastest server list.
      */
     suspend fun fetchSubscriptionAndRankTop15(
         subscriptionUrl: String,
+        context: Context? = null,
+        settings: AppSettingsState = AppSettingsState(),
         onProgress: (String) -> Unit = {}
     ): Result<List<ServerEntity>> = withContext(Dispatchers.IO) {
         try {
@@ -72,7 +98,7 @@ class V2RayParserAndFletcher {
                 response.body?.string().orEmpty()
             }
 
-            onProgress("Parsing V2Ray / Xray server configs…")
+            onProgress("Optimizing available locations…")
             val parsedNodes = parseImportPayload(
                 rawInput = bodyText,
                 subscriptionUrl = cleanUrl,
@@ -80,7 +106,7 @@ class V2RayParserAndFletcher {
             )
             if (parsedNodes.isEmpty()) {
                 return@withContext Result.failure(
-                    IllegalArgumentException("No valid V2Ray/Xray nodes found at this URL.")
+                    IllegalArgumentException("No valid server nodes found at this URL.")
                 )
             }
 
@@ -89,16 +115,18 @@ class V2RayParserAndFletcher {
             // evenly across the entire list, prioritizing non-Cloudflare dedicated servers first!
             val diverseCandidates = selectDiverseCandidatePool(parsedNodes, maxCandidates = 150)
 
-            onProgress("Ping testing ${diverseCandidates.size} global servers…")
+            onProgress("Testing ${diverseCandidates.size} global servers…")
             val rankedTop15 = benchmarkAndRankTop15(
                 servers = diverseCandidates,
+                context = context,
+                settings = settings,
                 onProgress = onProgress
             )
 
             if (rankedTop15.isEmpty()) {
                 return@withContext Result.failure(
                     IllegalStateException(
-                        "Tested ${diverseCandidates.size} nodes from subscription, but none responded to TCP ping."
+                        "Tested ${diverseCandidates.size} nodes from subscription, but none passed proxy connectivity checks."
                     )
                 )
             }
@@ -110,14 +138,23 @@ class V2RayParserAndFletcher {
     }
 
     /**
-     * Selects up to [maxCandidates] servers spread across different /16 network prefixes,
-     * domains, and explicit countries so a single Cloudflare US block doesn't monopolize the scan.
+     * Filters malformed nodes, preserves distinct CDN endpoints sharing an Anycast IP:port
+     * (distinguished by core/credential/SNI), and samples across /16 prefixes & domains.
      */
-    private fun selectDiverseCandidatePool(
+    internal fun selectDiverseCandidatePool(
         allParsed: List<ServerEntity>,
         maxCandidates: Int = 150
     ): List<ServerEntity> {
-        val uniqueByEndpoint = allParsed.distinctBy { "${it.host.lowercase()}:${it.port}" }
+        val validNodes = allParsed.filter { server ->
+            server.host.isNotBlank() &&
+                !server.host.contains(" ") &&
+                server.port in 1..65535 &&
+                server.uuidOrPassword.isNotBlank() &&
+                !(server.transport.equals("Reality", ignoreCase = true) && server.publicKey.isBlank())
+        }
+        val uniqueByEndpoint = validNodes.distinctBy {
+            "${it.protocolCore.lowercase()}:${it.host.lowercase()}:${it.port}:${it.uuidOrPassword}:${it.sni.lowercase()}"
+        }
         if (uniqueByEndpoint.size <= maxCandidates) return uniqueByEndpoint
 
         // Separate dedicated servers from Cloudflare Anycast CDN IP ranges
@@ -148,12 +185,12 @@ class V2RayParserAndFletcher {
             round++
         }
 
-        // Fill any remaining slots with Cloudflare nodes that have distinct SNI/host domains
+        // Fill any remaining slots with Cloudflare nodes that have distinct SNI/credential combinations
         if (selected.size < maxCandidates && cloudflareNodes.isNotEmpty()) {
             val remaining = maxCandidates - selected.size
             selected.addAll(
                 cloudflareNodes
-                    .distinctBy { it.sni.ifBlank { it.host } }
+                    .distinctBy { "${it.sni.ifBlank { it.host }}:${it.uuidOrPassword}" }
                     .take(remaining)
             )
         }
@@ -176,23 +213,29 @@ class V2RayParserAndFletcher {
     }
 
     /**
-     * Benchmarks candidate servers concurrently using real TCP socket handshake timing (`Socket.connect`),
-     * strictly drops dead/unreachable nodes, resolves real IPs and batch GeoIP countries for the fastest
-     * survivors, and selects a country-diverse Top 15 leaderboard sorted by lowest ping!
+     * Benchmarks candidate servers concurrently using TCP pre-filtering and real Xray outbound
+     * 204 delay verification (`Libv2ray.measureOutboundDelay`), resolves real IPs & GeoIP countries,
+     * and selects a country-diverse Top 15 leaderboard sorted by lowest real latency!
      */
     suspend fun benchmarkAndRankTop15(
         servers: List<ServerEntity>,
+        context: Context? = null,
+        settings: AppSettingsState = AppSettingsState(),
         onProgress: (String) -> Unit = {}
     ): List<ServerEntity> = withContext(Dispatchers.IO) {
         if (servers.isEmpty()) return@withContext emptyList()
 
+        val (udpHysteriaNodes, tcpNodes) = servers.partition {
+            it.protocolCore.contains("Hysteria", ignoreCase = true)
+        }
+
         val semaphore = Semaphore(40)
         val completedCounter = AtomicInteger(0)
         val liveCounter = AtomicInteger(0)
-        val total = servers.size
+        val totalTcp = tcpNodes.size
 
-        val measured = coroutineScope {
-            servers.map { server ->
+        val tcpSurvivors = coroutineScope {
+            tcpNodes.map { server ->
                 async {
                     semaphore.withPermit {
                         val livePing = measureRealTcpLatencyOrNull(
@@ -203,26 +246,72 @@ class V2RayParserAndFletcher {
                         val done = completedCounter.incrementAndGet()
                         if (livePing != null) {
                             val alive = liveCounter.incrementAndGet()
-                            if (done % 10 == 0 || done == total) {
-                                onProgress("Pinged $done/$total · $alive online…")
+                            if (done % 10 == 0 || done == totalTcp) {
+                                onProgress("TCP probed $done/$totalTcp · $alive online…")
                             }
                             server.copy(pingMs = livePing)
                         } else {
-                            if (done % 10 == 0 || done == total) {
-                                onProgress("Pinged $done/$total · ${liveCounter.get()} online…")
+                            if (done % 10 == 0 || done == totalTcp) {
+                                onProgress("TCP probed $done/$totalTcp · ${liveCounter.get()} online…")
                             }
                             null
                         }
                     }
                 }
             }.awaitAll()
-        }
+        }.filterNotNull().sortedBy { it.pingMs }
 
-        // Take the top 45 fastest responding servers so we can resolve their countries and
-        // pick a geographically diverse Top 15 (rather than 15 nodes in the same US datacenter).
-        val fastestPool = measured.filterNotNull()
-            .sortedBy { it.pingMs }
-            .take(45)
+        val verificationPool = (tcpSurvivors.take(40) + udpHysteriaNodes.take(10))
+            .distinctBy {
+                "${it.protocolCore.lowercase()}:${it.host.lowercase()}:${it.port}:${it.uuidOrPassword}:${it.sni.lowercase()}"
+            }
+
+        if (verificationPool.isEmpty()) return@withContext emptyList()
+
+        val fastestPool = if (context != null) {
+            onProgress("Verifying Xray handshake for ${verificationPool.size} fast servers…")
+            val xraySem = Semaphore(10)
+            val xrayDone = AtomicInteger(0)
+            val xrayOk = AtomicInteger(0)
+            val nativeMissing = AtomicBoolean(false)
+
+            val verified = coroutineScope {
+                verificationPool.map { server ->
+                    async {
+                        xraySem.withPermit {
+                            if (nativeMissing.get()) {
+                                return@withPermit if (server.pingMs > 0) server else null
+                            }
+                            val result = measureRealXrayDelayOrNull(context, server, settings)
+                            val done = xrayDone.incrementAndGet()
+                            when (result) {
+                                is XrayProbeResult.Success -> {
+                                    val ok = xrayOk.incrementAndGet()
+                                    if (done % 5 == 0 || done == verificationPool.size) {
+                                        onProgress("Verified $done/${verificationPool.size} · $ok working…")
+                                    }
+                                    server.copy(pingMs = result.delayMs)
+                                }
+                                XrayProbeResult.NativeUnavailable -> {
+                                    nativeMissing.set(true)
+                                    if (server.pingMs > 0) server else null
+                                }
+                                XrayProbeResult.Unreachable -> {
+                                    if (done % 5 == 0 || done == verificationPool.size) {
+                                        onProgress("Verified $done/${verificationPool.size} · ${xrayOk.get()} working…")
+                                    }
+                                    null
+                                }
+                            }
+                        }
+                    }
+                }.awaitAll()
+            }.filterNotNull().sortedBy { it.pingMs }.take(45)
+
+            verified
+        } else {
+            tcpSurvivors.take(45)
+        }
 
         if (fastestPool.isEmpty()) return@withContext emptyList()
 
@@ -302,15 +391,90 @@ class V2RayParserAndFletcher {
     }
 
     /**
-     * Fetches the user's real current public IP and Country from live GeoIP endpoints.
+     * Fetches the user's real current public IP and Country from live HTTPS-first GeoIP endpoints.
+     * When [socksProxyPort] is provided (Proxy Mode), probes exit IP directly through 127.0.0.1:[socksProxyPort].
      */
-    suspend fun fetchDevicePublicIpInfo(): Triple<String, String, String> = withContext(Dispatchers.IO) {
-        // Returns Triple(ip, countryName, countryCode)
+    suspend fun fetchDevicePublicIpInfo(socksProxyPort: Int? = null): Triple<String, String, String> = withContext(Dispatchers.IO) {
+        evictConnectionPools()
+        val client = if (socksProxyPort != null) {
+            geoHttpClient.newBuilder()
+                .proxy(Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socksProxyPort)))
+                .connectTimeout(6, TimeUnit.SECONDS)
+                .readTimeout(6, TimeUnit.SECONDS)
+                .build()
+        } else {
+            geoHttpClient
+        }
+
+        // 1. Primary HTTPS endpoint: ipwho.is
+        try {
+            val req = Request.Builder()
+                .url("https://ipwho.is/")
+                .header("Accept", "application/json")
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    val json = JSONObject(resp.body?.string().orEmpty())
+                    if (json.optBoolean("success", true)) {
+                        val ip = json.optString("ip", "")
+                        val country = json.optString("country", "")
+                        val code = json.optString("country_code", "").uppercase()
+                        if (ip.isNotBlank() && code.length == 2) {
+                            return@withContext Triple(ip, country.ifBlank { countryNameFromIsoCode(code) }, code)
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+
+        // 2. Backup HTTPS endpoint: ipapi.co
+        try {
+            val req = Request.Builder()
+                .url("https://ipapi.co/json/")
+                .header("Accept", "application/json")
+                .header("User-Agent", "HollowVPN/1.0")
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    val json = JSONObject(resp.body?.string().orEmpty())
+                    val ip = json.optString("ip", "")
+                    val country = json.optString("country_name", "")
+                    val code = json.optString("country_code", "").uppercase()
+                    if (ip.isNotBlank() && code.length == 2) {
+                        return@withContext Triple(ip, country.ifBlank { countryNameFromIsoCode(code) }, code)
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+
+        // 3. Backup HTTPS endpoint: api.ip.sb
+        try {
+            val req = Request.Builder()
+                .url("https://api.ip.sb/geoip")
+                .header("Accept", "application/json")
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    val json = JSONObject(resp.body?.string().orEmpty())
+                    val ip = json.optString("ip", "")
+                    val country = json.optString("country", "")
+                    val code = json.optString("country_code", "").uppercase()
+                    if (ip.isNotBlank() && code.length == 2) {
+                        return@withContext Triple(ip, country.ifBlank { countryNameFromIsoCode(code) }, code)
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+
+        // 4. Legacy fallback: ip-api.com
         try {
             val req = Request.Builder()
                 .url("http://ip-api.com/json/?fields=status,country,countryCode,query")
                 .build()
-            geoHttpClient.newCall(req).execute().use { resp ->
+            client.newCall(req).execute().use { resp ->
                 if (resp.isSuccessful) {
                     val json = JSONObject(resp.body?.string().orEmpty())
                     if (json.optString("status") == "success") {
@@ -326,26 +490,7 @@ class V2RayParserAndFletcher {
         } catch (_: Exception) {
         }
 
-        try {
-            val req = Request.Builder()
-                .url("https://ipwho.is/")
-                .header("Accept", "application/json")
-                .build()
-            geoHttpClient.newCall(req).execute().use { resp ->
-                if (resp.isSuccessful) {
-                    val json = JSONObject(resp.body?.string().orEmpty())
-                    val ip = json.optString("ip", "")
-                    val country = json.optString("country", "")
-                    val code = json.optString("country_code", "").uppercase()
-                    if (ip.isNotBlank() && code.length == 2) {
-                        return@withContext Triple(ip, country.ifBlank { countryNameFromIsoCode(code) }, code)
-                    }
-                }
-            }
-        } catch (_: Exception) {
-        }
-
-        Triple("Detecting…", "Unknown", "DE")
+        Triple("Unavailable", "Unknown", "XX")
     }
 
     /**
@@ -474,13 +619,14 @@ class V2RayParserAndFletcher {
             "RO" -> "Romania"
             "AE" -> "United Arab Emirates"
             "IR" -> "Iran"
+            "XX" -> "Unknown"
             else -> {
                 try {
                     Locale("", code.uppercase()).getDisplayCountry(Locale.ENGLISH)
                         .takeIf { it.isNotBlank() && it != code.uppercase() }
-                        ?: "Germany"
+                        ?: "Unknown"
                 } catch (_: Exception) {
-                    "Germany"
+                    "Unknown"
                 }
             }
         }
@@ -542,6 +688,66 @@ class V2RayParserAndFletcher {
         }
     }
 
+    suspend fun measureRealXrayDelayOrNull(
+        context: Context,
+        server: ServerEntity,
+        settings: AppSettingsState = AppSettingsState()
+    ): XrayProbeResult = withContext(Dispatchers.IO) {
+        try {
+            ensureCoreEnvInitialized(context)
+            val baseConfig = server.rawConfigJson.ifBlank { generateXrayJsonForServer(server) }
+            val testConfig = applyRuntimeSettingsToXrayJson(baseConfig, settings.copy(tunMode = false))
+            val primaryDelay = try {
+                Libv2ray.measureOutboundDelay(testConfig, DELAY_PROBE_PRIMARY)
+            } catch (e: UnsatisfiedLinkError) {
+                throw e
+            } catch (e: NoClassDefFoundError) {
+                throw e
+            } catch (_: Throwable) {
+                -1L
+            }
+            if (primaryDelay > 0L) {
+                return@withContext XrayProbeResult.Success(primaryDelay.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
+            }
+            val backupDelay = try {
+                Libv2ray.measureOutboundDelay(testConfig, DELAY_PROBE_BACKUP)
+            } catch (e: UnsatisfiedLinkError) {
+                throw e
+            } catch (e: NoClassDefFoundError) {
+                throw e
+            } catch (_: Throwable) {
+                -1L
+            }
+            if (backupDelay > 0L) {
+                XrayProbeResult.Success(backupDelay.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
+            } else {
+                XrayProbeResult.Unreachable
+            }
+        } catch (_: UnsatisfiedLinkError) {
+            XrayProbeResult.NativeUnavailable
+        } catch (_: NoClassDefFoundError) {
+            XrayProbeResult.NativeUnavailable
+        } catch (_: Throwable) {
+            XrayProbeResult.Unreachable
+        }
+    }
+
+    private fun ensureCoreEnvInitialized(context: Context) {
+        if (coreEnvInitialized) return
+        val app = context.applicationContext
+        Seq.setContext(app)
+        val androidId = Settings.Secure.getString(app.contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
+        val deviceId = Base64.encodeToString(
+            MessageDigest.getInstance("SHA-256")
+                .digest("hollow:$androidId".toByteArray(Charsets.UTF_8))
+                .copyOf(32),
+            Base64.NO_PADDING or Base64.URL_SAFE or Base64.NO_WRAP
+        )
+        val assetPath = (app.getExternalFilesDir("assets") ?: app.getDir("assets", 0)).absolutePath
+        Libv2ray.initCoreEnv(assetPath, deviceId)
+        coreEnvInitialized = true
+    }
+
     suspend fun resolveServerIpAddress(host: String): String = withContext(Dispatchers.IO) {
         val trimmed = host.trim()
         try {
@@ -596,9 +802,9 @@ class V2RayParserAndFletcher {
             lower.startsWith("trojan://") -> parseFlexibleV2RayUri(clean, "Trojan", subscriptionUrl, isCustom)
             lower.startsWith("ss://") -> parseShadowsocksUri(clean, subscriptionUrl, isCustom)
             lower.startsWith("hy2://") || lower.startsWith("hysteria2://") ->
-                parseFlexibleV2RayUri(clean, "Hysteria2", subscriptionUrl, isCustom)
-            lower.startsWith("tuic://") ->
-                parseFlexibleV2RayUri(clean, "TUIC", subscriptionUrl, isCustom)
+                parseHysteria2Uri(clean, subscriptionUrl, isCustom)
+            // TUIC outbounds are not supported by Xray-core / AndroidLibXrayLite.
+            lower.startsWith("tuic://") -> null
             else -> null
         }
     }
@@ -614,8 +820,81 @@ class V2RayParserAndFletcher {
         val spiderX: String = "",
         val flow: String = "",
         val alpn: List<String> = emptyList(),
-        val allowInsecure: Boolean = false
+        val allowInsecure: Boolean = false,
+        val obfs: String = "",
+        val obfsPassword: String = "",
+        val mport: String = ""
     )
+
+    private fun parseHysteria2Uri(
+        uriLine: String,
+        subscriptionUrl: String,
+        isCustom: Boolean
+    ): ServerEntity? {
+        return try {
+            val withoutScheme = uriLine.substringAfter("://")
+            val rawRemark = if (withoutScheme.contains("#")) {
+                safeUrlDecode(withoutScheme.substringAfterLast("#"))
+            } else ""
+            val beforeFragment = withoutScheme.substringBefore("#")
+            val rawQuery = if (beforeFragment.contains("?")) beforeFragment.substringAfter("?") else ""
+            val authority = beforeFragment.substringBefore("?")
+            if (!authority.contains("@")) return null
+
+            val password = safeUrlDecode(authority.substringBeforeLast("@")).trim()
+            if (password.isBlank()) return null
+
+            val hostPortPart = authority.substringAfterLast("@").trim()
+            val (host, port) = extractHostAndPort(hostPortPart, defaultPort = 443)
+            if (host.isBlank() || host.contains(" ")) return null
+
+            val queryParams = parseQueryParams(rawQuery)
+            val sni = (queryParams["sni"] ?: queryParams["peer"] ?: "").trim()
+            val allowInsecure = queryParams["insecure"] == "1" ||
+                queryParams["insecure"].equals("true", ignoreCase = true) ||
+                queryParams["allowInsecure"] == "1" ||
+                queryParams["allowInsecure"].equals("true", ignoreCase = true)
+            val obfs = queryParams["obfs"].orEmpty().trim()
+            val obfsPassword = queryParams["obfs-password"].orEmpty().trim()
+            val mport = queryParams["mport"].orEmpty().trim()
+            val alpn = queryParams["alpn"]
+                ?.split(",")
+                ?.map { it.trim() }
+                ?.filter { it.isNotEmpty() }
+                .orEmpty()
+                .ifEmpty { listOf("h3") }
+
+            val (countryName, countryCode) = inferCountryFromRemarkOrHost("$rawRemark $sni", host)
+            val entity = ServerEntity(
+                countryName = countryName,
+                countryCode = countryCode,
+                protocolDisplay = "V2Ray · Hysteria2 · $host",
+                protocolCore = "Hysteria2 (Xray)",
+                transport = "Hysteria2",
+                host = host,
+                resolvedIp = host,
+                port = port,
+                uuidOrPassword = password,
+                sni = sni,
+                shareUri = uriLine,
+                pingMs = 0,
+                isCustom = isCustom,
+                subscriptionUrl = subscriptionUrl
+            )
+            val params = TransportBuildParams(
+                security = "tls",
+                network = "hysteria",
+                alpn = alpn,
+                allowInsecure = allowInsecure,
+                obfs = obfs,
+                obfsPassword = obfsPassword,
+                mport = mport
+            )
+            entity.copy(rawConfigJson = generateXrayJsonForServer(entity, params))
+        } catch (_: Exception) {
+            null
+        }
+    }
 
     private fun parseVmessUri(
         uriLine: String,
@@ -901,7 +1180,11 @@ class V2RayParserAndFletcher {
 
                 val vnext = settings.optJSONArray("vnext")
                 val serversArr = settings.optJSONArray("servers")
-                if (vnext != null && vnext.length() > 0) {
+                if (protocol == "hysteria" || protocol == "hysteria2") {
+                    host = settings.optString("address", "").trim()
+                    port = settings.optInt("port", 443)
+                    credential = streamSettings.optJSONObject("hysteriaSettings")?.optString("auth").orEmpty()
+                } else if (vnext != null && vnext.length() > 0) {
                     val first = vnext.getJSONObject(0)
                     host = first.optString("address", "").trim()
                     port = first.optInt("port", 443)
@@ -926,6 +1209,7 @@ class V2RayParserAndFletcher {
                 val pbk = realitySettings?.optString("publicKey").orEmpty()
 
                 val transportLabel = when {
+                    protocol == "hysteria" || protocol == "hysteria2" -> "Hysteria2"
                     security == "reality" -> "Reality"
                     network == "grpc" -> "gRPC"
                     network == "ws" -> "WebSocket"
@@ -938,6 +1222,7 @@ class V2RayParserAndFletcher {
                     "vmess" -> "VMess (V2Ray)"
                     "trojan" -> "Trojan (V2Ray)"
                     "shadowsocks" -> "Shadowsocks (Xray)"
+                    "hysteria", "hysteria2" -> "Hysteria2 (Xray)"
                     else -> "VLESS (V2Ray)"
                 }
 
@@ -1004,24 +1289,51 @@ class V2RayParserAndFletcher {
         return generateXrayJsonForServer(server, params = null)
     }
 
+    fun generateXrayJsonForServer(
+        server: ServerEntity,
+        wsPath: String = "",
+        wsHost: String = "",
+        grpcServiceName: String = "",
+        shortId: String = "",
+        flow: String = ""
+    ): String {
+        return generateXrayJsonForServer(
+            server = server,
+            params = TransportBuildParams(
+                wsPath = wsPath,
+                wsHost = wsHost,
+                grpcServiceName = grpcServiceName,
+                shortId = shortId,
+                flow = flow
+            )
+        )
+    }
+
     private fun generateXrayJsonForServer(
         server: ServerEntity,
         params: TransportBuildParams?
     ): String {
         if (server.rawConfigJson.isNotBlank()) return server.rawConfigJson
         val protocolLower = when {
+            server.protocolCore.contains("Hysteria", ignoreCase = true) -> "hysteria"
             server.protocolCore.contains("VMess", ignoreCase = true) -> "vmess"
             server.protocolCore.contains("Trojan", ignoreCase = true) -> "trojan"
             server.protocolCore.contains("Shadowsocks", ignoreCase = true) -> "shadowsocks"
             else -> "vless"
         }
-        val networkLower = params?.network?.ifBlank { null } ?: when (server.transport.lowercase()) {
-            "websocket", "ws" -> "ws"
-            "grpc" -> "grpc"
-            "http/2", "h2" -> "h2"
-            else -> "tcp"
+        val networkLower = if (protocolLower == "hysteria") {
+            "hysteria"
+        } else {
+            params?.network?.ifBlank { null } ?: when (server.transport.lowercase()) {
+                "websocket", "ws" -> "ws"
+                "grpc" -> "grpc"
+                "http/2", "h2" -> "h2"
+                else -> "tcp"
+            }
         }
-        val securityLower = params?.security?.ifBlank { null } ?: when {
+        val securityLower = when {
+            protocolLower == "hysteria" -> "tls"
+            !params?.security.isNullOrBlank() -> params?.security!!
             server.transport.equals("Reality", ignoreCase = true) || server.publicKey.isNotBlank() -> "reality"
             protocolLower == "shadowsocks" -> "none"
             protocolLower == "trojan" -> "tls"
@@ -1053,6 +1365,12 @@ class V2RayParserAndFletcher {
 
         val outboundSettings = JSONObject()
         when (protocolLower) {
+            "hysteria" -> {
+                outboundSettings
+                    .put("version", 2)
+                    .put("address", server.host)
+                    .put("port", server.port)
+            }
             "shadowsocks" -> {
                 val method = server.uuidOrPassword.substringBefore(":").ifBlank { "aes-256-gcm" }
                 val password = if (server.uuidOrPassword.contains(":")) {
@@ -1098,7 +1416,7 @@ class V2RayParserAndFletcher {
                 )
             }
             else -> {
-                val flowValue = params?.flow
+                val flowValue = params?.flow?.ifBlank { null }
                     ?: if (securityLower == "reality" && networkLower == "tcp") "xtls-rprx-vision" else ""
                 val userObj = JSONObject()
                     .put("id", server.uuidOrPassword)
@@ -1139,17 +1457,52 @@ class V2RayParserAndFletcher {
                 val tlsObj = JSONObject()
                     .put("serverName", effectiveSni)
                     .put("allowInsecure", params?.allowInsecure ?: false)
-                if (!params?.fingerprint.isNullOrBlank()) {
+                if (!params?.fingerprint.isNullOrBlank() && protocolLower != "hysteria") {
                     tlsObj.put("fingerprint", params?.fingerprint)
                 }
-                if (!params?.alpn.isNullOrEmpty()) {
-                    tlsObj.put("alpn", JSONArray(params?.alpn))
+                val alpnList = params?.alpn.orEmpty().ifEmpty {
+                    if (protocolLower == "hysteria") listOf("h3") else emptyList()
+                }
+                if (alpnList.isNotEmpty()) {
+                    tlsObj.put("alpn", JSONArray(alpnList))
                 }
                 streamSettings.put("tlsSettings", tlsObj)
             }
         }
 
         when (networkLower) {
+            "hysteria" -> {
+                streamSettings.put(
+                    "hysteriaSettings",
+                    JSONObject()
+                        .put("version", 2)
+                        .put("auth", server.uuidOrPassword)
+                )
+                val udpMasks = JSONArray()
+                if (params?.obfs.equals("salamander", ignoreCase = true) && !params?.obfsPassword.isNullOrBlank()) {
+                    udpMasks.put(
+                        JSONObject()
+                            .put("type", "salamander")
+                            .put("settings", JSONObject().put("password", params?.obfsPassword))
+                    )
+                }
+                if (!params?.mport.isNullOrBlank()) {
+                    udpMasks.put(
+                        JSONObject()
+                            .put("type", "udphop")
+                            .put(
+                                "settings",
+                                JSONObject()
+                                    .put("mode", "intervalremote")
+                                    .put("interval", "30")
+                                    .put("remotePorts", params?.mport)
+                            )
+                    )
+                }
+                if (udpMasks.length() > 0) {
+                    streamSettings.put("finalmask", JSONObject().put("udp", udpMasks))
+                }
+            }
             "ws" -> {
                 val wsObj = JSONObject()
                     .put("path", params?.wsPath?.ifBlank { "/" } ?: "/")
@@ -1200,7 +1553,12 @@ class V2RayParserAndFletcher {
                 "outbounds",
                 JSONArray()
                     .put(proxyOutbound)
-                    .put(JSONObject().put("tag", "direct").put("protocol", "freedom"))
+                    .put(
+                        JSONObject()
+                            .put("tag", "direct")
+                            .put("protocol", "freedom")
+                            .put("settings", JSONObject().put("domainStrategy", "UseIP"))
+                    )
                     .put(JSONObject().put("tag", "block").put("protocol", "blackhole"))
             )
 
@@ -1209,7 +1567,8 @@ class V2RayParserAndFletcher {
 
     /**
      * Applies user DNS, Routing Mode (CIDR-only since geoip.dat/geosite.dat are omitted in Lite AAR),
-     * IPv6 strategy, TUN vs local proxy inbounds, and Xray traffic stats policy to any Xray config JSON.
+     * IPv6 strategy, TUN vs local proxy inbounds, ordered proxy/direct/block outbounds,
+     * QUIC UDP/443 block, IPv6 leak block, and Xray traffic stats policy.
      */
     fun applyRuntimeSettingsToXrayJson(
         baseJson: String,
@@ -1274,15 +1633,43 @@ class V2RayParserAndFletcher {
             }
             root.put("inbounds", updatedInbounds)
 
-            // 2. Ensure "direct" freedom outbound exists for bypass/direct routing rules
-            val outbounds = root.optJSONArray("outbounds") ?: JSONArray()
-            val hasDirect = (0 until outbounds.length()).any {
-                outbounds.optJSONObject(it)?.optString("tag") == "direct"
+            // 2. Normalize outbounds: primary proxy outbound FIRST, followed by direct and block
+            val existingOutbounds = root.optJSONArray("outbounds") ?: JSONArray()
+            val proxyOutbounds = mutableListOf<JSONObject>()
+            var directOutbound: JSONObject? = null
+            var blockOutbound: JSONObject? = null
+
+            for (i in 0 until existingOutbounds.length()) {
+                val ob = existingOutbounds.optJSONObject(i) ?: continue
+                val proto = ob.optString("protocol", "").lowercase()
+                val tag = ob.optString("tag", "").lowercase()
+                when {
+                    proto == "freedom" || tag == "direct" -> if (directOutbound == null) directOutbound = ob
+                    proto == "blackhole" || tag == "block" -> if (blockOutbound == null) blockOutbound = ob
+                    proto in listOf("dns") -> Unit
+                    else -> proxyOutbounds.add(ob)
+                }
             }
-            if (!hasDirect) {
-                outbounds.put(JSONObject().put("tag", "direct").put("protocol", "freedom"))
-            }
-            root.put("outbounds", outbounds)
+
+            val proxyTag = proxyOutbounds.firstOrNull()?.optString("tag")
+                ?.takeIf { it.isNotBlank() && it !in listOf("direct", "block", "dns-out") }
+                ?: "proxy"
+            proxyOutbounds.firstOrNull()?.put("tag", proxyTag)
+
+            val orderedOutbounds = JSONArray()
+            proxyOutbounds.forEach { orderedOutbounds.put(it) }
+            orderedOutbounds.put(
+                directOutbound ?: JSONObject()
+                    .put("tag", "direct")
+                    .put("protocol", "freedom")
+                    .put("settings", JSONObject().put("domainStrategy", "UseIP"))
+            )
+            orderedOutbounds.put(
+                blockOutbound ?: JSONObject()
+                    .put("tag", "block")
+                    .put("protocol", "blackhole")
+            )
+            root.put("outbounds", orderedOutbounds)
 
             // 3. DNS configuration matching user's DNS setting & IPv6 preference
             val dnsServers = JSONArray()
@@ -1310,35 +1697,61 @@ class V2RayParserAndFletcher {
                     .put("queryStrategy", if (settings.ipv6Enabled) "UseIP" else "UseIPv4")
             )
 
-            // 4. Routing rules (strictly CIDR/network-based — no geoip/geosite files required)
+            // 4. Routing rules (CIDR/network-based; LAN bypass placed first when active)
             val rules = JSONArray()
-            when {
-                settings.routingMode.contains("Direct Only", ignoreCase = true) -> {
+            if (settings.routingMode.contains("Direct Only", ignoreCase = true)) {
+                rules.put(
+                    JSONObject()
+                        .put("type", "field")
+                        .put("network", "tcp,udp")
+                        .put("outboundTag", "direct")
+                )
+            } else {
+                if (settings.routingMode.contains("Bypass LAN", ignoreCase = true)) {
+                    val bypassCidrs = JSONArray()
+                        .put("10.0.0.0/8")
+                        .put("172.16.0.0/12")
+                        .put("192.168.0.0/16")
+                        .put("127.0.0.0/8")
+                        .put("169.254.0.0/16")
+                        .put("224.0.0.0/4")
+                        .put("fc00::/7")
+                        .put("fe80::/10")
+                        .put("ff00::/8")
+                    if (settings.routingMode.contains("Domestic", ignoreCase = true)) {
+                        bypassCidrs.put("100.64.0.0/10")
+                        bypassCidrs.put("198.18.0.0/15")
+                    }
+                    rules.put(
+                        JSONObject()
+                            .put("type", "field")
+                            .put("ip", bypassCidrs)
+                            .put("outboundTag", "direct")
+                    )
+                }
+                if (!settings.ipv6Enabled) {
+                    rules.put(
+                        JSONObject()
+                            .put("type", "field")
+                            .put("ip", JSONArray().put("::/0"))
+                            .put("outboundTag", "block")
+                    )
+                }
+                // Block QUIC (UDP 443) so browsers cleanly fall back to TLS/TCP over the tunnel
+                rules.put(
+                    JSONObject()
+                        .put("type", "field")
+                        .put("port", "443")
+                        .put("network", "udp")
+                        .put("outboundTag", "block")
+                )
+                // Explicit catch-all routing rule to the primary proxy outbound
+                if (proxyOutbounds.isNotEmpty()) {
                     rules.put(
                         JSONObject()
                             .put("type", "field")
                             .put("network", "tcp,udp")
-                            .put("outboundTag", "direct")
-                    )
-                }
-                settings.routingMode.contains("Bypass LAN", ignoreCase = true) -> {
-                    rules.put(
-                        JSONObject()
-                            .put("type", "field")
-                            .put(
-                                "ip",
-                                JSONArray()
-                                    .put("10.0.0.0/8")
-                                    .put("172.16.0.0/12")
-                                    .put("192.168.0.0/16")
-                                    .put("127.0.0.0/8")
-                                    .put("169.254.0.0/16")
-                                    .put("224.0.0.0/4")
-                                    .put("fc00::/7")
-                                    .put("fe80::/10")
-                                    .put("ff00::/8")
-                            )
-                            .put("outboundTag", "direct")
+                            .put("outboundTag", proxyTag)
                     )
                 }
             }
@@ -1477,5 +1890,7 @@ class V2RayParserAndFletcher {
 
     companion object {
         const val DEFAULT_PUBLIC_V2RAY_SUB_URL = AppSettingsState.DEFAULT_SUBSCRIPTION_URL
+        private const val DELAY_PROBE_PRIMARY = "https://www.gstatic.com/generate_204"
+        private const val DELAY_PROBE_BACKUP = "https://cp.cloudflare.com/generate_204"
     }
 }

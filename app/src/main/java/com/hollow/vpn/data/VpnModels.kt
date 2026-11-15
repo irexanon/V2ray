@@ -81,6 +81,21 @@ data class AppSettingsState(
     }
 }
 
+data class ActiveTunnelSnapshot(
+    val country: String,
+    val host: String,
+    val port: Int,
+    val protocol: String,
+    val xrayJson: String,
+    val tunMode: Boolean,
+    val enableIpv6: Boolean,
+    val dnsMode: String,
+    val routingMode: String,
+    val perAppProxyEnabled: Boolean,
+    val bypassSelectedApps: Boolean,
+    val selectedAppPackages: Set<String>
+)
+
 class VpnPreferencesStore(context: Context) {
     private val prefs = context.applicationContext.getSharedPreferences("v2ray_vpn_prefs", Context.MODE_PRIVATE)
 
@@ -126,6 +141,53 @@ class VpnPreferencesStore(context: Context) {
             .putBoolean("per_app_proxy", state.perAppProxyEnabled)
             .putBoolean("bypass_selected_apps", state.bypassSelectedApps)
             .putStringSet("per_app_packages", state.selectedAppPackages)
+            .apply()
+    }
+
+    fun saveActiveTunnelSnapshot(snapshot: ActiveTunnelSnapshot) {
+        prefs.edit()
+            .putString("snap_country", snapshot.country)
+            .putString("snap_host", snapshot.host)
+            .putInt("snap_port", snapshot.port)
+            .putString("snap_protocol", snapshot.protocol)
+            .putString("snap_xray_json", snapshot.xrayJson)
+            .putBoolean("snap_tun_mode", snapshot.tunMode)
+            .putBoolean("snap_ipv6", snapshot.enableIpv6)
+            .putString("snap_dns_mode", snapshot.dnsMode)
+            .putString("snap_routing_mode", snapshot.routingMode)
+            .putBoolean("snap_per_app", snapshot.perAppProxyEnabled)
+            .putBoolean("snap_bypass_selected", snapshot.bypassSelectedApps)
+            .putStringSet("snap_selected_packages", snapshot.selectedAppPackages)
+            .apply()
+    }
+
+    fun loadActiveTunnelSnapshot(): ActiveTunnelSnapshot? {
+        val host = prefs.getString("snap_host", "").orEmpty()
+        val xrayJson = prefs.getString("snap_xray_json", "").orEmpty()
+        if (host.isBlank() || xrayJson.isBlank()) return null
+        return ActiveTunnelSnapshot(
+            country = prefs.getString("snap_country", "Server") ?: "Server",
+            host = host,
+            port = prefs.getInt("snap_port", 443),
+            protocol = prefs.getString("snap_protocol", "VLESS (V2Ray)") ?: "VLESS (V2Ray)",
+            xrayJson = xrayJson,
+            tunMode = prefs.getBoolean("snap_tun_mode", true),
+            enableIpv6 = prefs.getBoolean("snap_ipv6", false),
+            dnsMode = prefs.getString("snap_dns_mode", "Auto (DoH)") ?: "Auto (DoH)",
+            routingMode = prefs.getString("snap_routing_mode", "Global") ?: "Global",
+            perAppProxyEnabled = prefs.getBoolean("snap_per_app", false),
+            bypassSelectedApps = prefs.getBoolean("snap_bypass_selected", false),
+            selectedAppPackages = prefs.getStringSet("snap_selected_packages", emptySet()) ?: emptySet()
+        )
+    }
+
+    fun clearActiveTunnelSnapshot() {
+        prefs.edit()
+            .remove("snap_country")
+            .remove("snap_host")
+            .remove("snap_port")
+            .remove("snap_protocol")
+            .remove("snap_xray_json")
             .apply()
     }
 }

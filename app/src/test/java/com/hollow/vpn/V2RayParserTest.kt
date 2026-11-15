@@ -2,6 +2,7 @@ package com.hollow.vpn
 
 import android.util.Base64
 import com.hollow.vpn.data.AppSettingsState
+import com.hollow.vpn.data.ServerEntity
 import com.hollow.vpn.vpn.V2RayParserAndFletcher
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -134,5 +135,144 @@ class V2RayParserTest {
         assertTrue(protocols.contains("socks"))
         assertTrue(protocols.contains("http"))
         assertNotNull(runtime.optJSONObject("stats"))
+    }
+
+    @Test
+    fun `parses Hysteria2 URI with salamander obfs and port hop into native Xray hysteria outbound`() {
+        val uri = "hy2://my-hy2-secret@de.hy2.example.com:8443?insecure=1&sni=cdn.hy2.example.com&obfs=salamander&obfs-password=salpass&mport=20000-30000#Germany%20Hy2"
+        val servers = parser.parseImportPayload(uri)
+        assertEquals(1, servers.size)
+        val server = servers.first()
+        assertEquals("DE", server.countryCode)
+        assertEquals("Hysteria2 (Xray)", server.protocolCore)
+        assertEquals("Hysteria2", server.transport)
+
+        val json = JSONObject(server.rawConfigJson)
+        val proxy = json.getJSONArray("outbounds").getJSONObject(0)
+        assertEquals("hysteria", proxy.getString("protocol"))
+        assertEquals(2, proxy.getJSONObject("settings").getInt("version"))
+        assertEquals("de.hy2.example.com", proxy.getJSONObject("settings").getString("address"))
+        assertEquals(8443, proxy.getJSONObject("settings").getInt("port"))
+
+        val stream = proxy.getJSONObject("streamSettings")
+        assertEquals("hysteria", stream.getString("network"))
+        assertEquals("tls", stream.getString("security"))
+        assertEquals("my-hy2-secret", stream.getJSONObject("hysteriaSettings").getString("auth"))
+        assertEquals("h3", stream.getJSONObject("tlsSettings").getJSONArray("alpn").getString(0))
+        assertTrue(stream.getJSONObject("tlsSettings").getBoolean("allowInsecure"))
+
+        val udpMasks = stream.getJSONObject("finalmask").getJSONArray("udp")
+        assertEquals(2, udpMasks.length())
+        assertEquals("salamander", udpMasks.getJSONObject(0).getString("type"))
+        assertEquals("udphop", udpMasks.getJSONObject(1).getString("type"))
+
+        val reparsed = parser.parseRawXrayJson(server.rawConfigJson)
+        assertEquals(1, reparsed.size)
+        assertEquals("Hysteria2 (Xray)", reparsed.first().protocolCore)
+        assertEquals("my-hy2-secret", reparsed.first().uuidOrPassword)
+    }
+
+    @Test
+    fun `rejects unsupported tuic URIs instead of misrouting as VLESS`() {
+        val uri = "tuic://uuid:pass@tuic.example.com:443?alpn=h3#Unsupported"
+        val servers = parser.parseImportPayload(uri)
+        assertTrue(servers.isEmpty())
+    }
+
+    @Test
+    fun `applyRuntimeSettingsToXrayJson reorders proxy outbound first and injects IPv6 block, QUIC block, and catch-all`() {
+        val invertedJson = JSONObject()
+            .put(
+                "outbounds",
+                org.json.JSONArray()
+                    .put(JSONObject().put("tag", "direct").put("protocol", "freedom"))
+                    .put(
+                        JSONObject()
+                            .put("tag", "my-vless")
+                            .put("protocol", "vless")
+                            .put("settings", JSONObject())
+                    )
+            )
+            .toString()
+
+        val settings = AppSettingsState(
+            routingMode = "Global",
+            tunMode = true,
+            ipv6Enabled = false
+        )
+        val runtime = JSONObject(parser.applyRuntimeSettingsToXrayJson(invertedJson, settings))
+
+        val outbounds = runtime.getJSONArray("outbounds")
+        assertEquals("my-vless", outbounds.getJSONObject(0).getString("tag"))
+        assertEquals("vless", outbounds.getJSONObject(0).getString("protocol"))
+        assertEquals("UseIPv4", runtime.getJSONObject("dns").getString("queryStrategy"))
+
+        val rules = runtime.getJSONObject("routing").getJSONArray("rules")
+        assertEquals(3, rules.length())
+        assertEquals("block", rules.getJSONObject(0).getString("outboundTag"))
+        assertEquals("::/0", rules.getJSONObject(0).getJSONArray("ip").getString(0))
+        assertEquals("block", rules.getJSONObject(1).getString("outboundTag"))
+        assertEquals("443", rules.getJSONObject(1).getString("port"))
+        assertEquals("udp", rules.getJSONObject(1).getString("network"))
+        assertEquals("my-vless", rules.getJSONObject(2).getString("outboundTag"))
+        assertEquals("tcp,udp", rules.getJSONObject(2).getString("network"))
+    }
+
+    @Test
+    fun `applyRuntimeSettingsToXrayJson injects CGNAT and domestic reserved CIDRs for Bypass LAN & Domestic`() {
+        val uri = "vless://11111111-2222-3333-4444-555555555555@de.example.com:443?security=tls&type=tcp#Germany"
+        val baseJson = parser.parseImportPayload(uri).first().rawConfigJson
+
+        val settings = AppSettingsState(routingMode = "Bypass LAN & Domestic")
+        val runtime = JSONObject(parser.applyRuntimeSettingsToXrayJson(baseJson, settings))
+        val rules = runtime.getJSONObject("routing").getJSONArray("rules")
+        assertEquals("direct", rules.getJSONObject(0).getString("outboundTag"))
+
+        val ipArr = rules.getJSONObject(0).getJSONArray("ip")
+        val ips = (0 until ipArr.length()).map { ipArr.getString(it) }
+        assertTrue(ips.contains("192.168.0.0/16"))
+        assertTrue(ips.contains("100.64.0.0/10"))
+        assertTrue(ips.contains("198.18.0.0/15"))
+    }
+
+    @Test
+    fun `selectDiverseCandidatePool preserves distinct CDN endpoints and filters malformed Reality nodes`() {
+        val cdnNodeOne = ServerEntity(
+            countryName = "Germany",
+            countryCode = "DE",
+            protocolDisplay = "V2Ray · WebSocket",
+            protocolCore = "VLESS (V2Ray)",
+            transport = "WebSocket",
+            host = "104.16.10.20",
+            port = 443,
+            uuidOrPassword = "11111111-1111-1111-1111-111111111111",
+            sni = "cdn-one.example.org",
+            pingMs = 0
+        )
+        val cdnNodeTwo = cdnNodeOne.copy(
+            uuidOrPassword = "22222222-2222-2222-2222-222222222222",
+            sni = "cdn-two.example.org"
+        )
+        val brokenReality = ServerEntity(
+            countryName = "Netherlands",
+            countryCode = "NL",
+            protocolDisplay = "V2Ray · Reality",
+            protocolCore = "VLESS (V2Ray)",
+            transport = "Reality",
+            host = "185.10.20.30",
+            port = 443,
+            uuidOrPassword = "33333333-3333-3333-3333-333333333333",
+            publicKey = "",
+            pingMs = 0
+        )
+
+        val selected = parser.selectDiverseCandidatePool(
+            listOf(cdnNodeOne, cdnNodeOne.copy(), cdnNodeTwo, brokenReality),
+            maxCandidates = 150
+        )
+
+        assertEquals(2, selected.size)
+        assertTrue(selected.any { it.sni == "cdn-one.example.org" })
+        assertTrue(selected.any { it.sni == "cdn-two.example.org" })
     }
 }

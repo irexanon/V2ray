@@ -2,9 +2,6 @@ package com.hollow.vpn.ui
 
 import android.app.Application
 import android.content.Intent
-import android.net.TrafficStats
-import android.provider.Settings
-import android.util.Base64
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.hollow.vpn.data.AppSettingsState
@@ -14,12 +11,16 @@ import com.hollow.vpn.data.SubscriptionEntity
 import com.hollow.vpn.data.VpnDatabase
 import com.hollow.vpn.data.VpnPreferencesStore
 import com.hollow.vpn.vpn.V2RayParserAndFletcher
+import com.hollow.vpn.vpn.XrayProbeResult
 import com.hollow.vpn.vpn.XrayVpnService
-import go.Seq
-import libv2ray.Libv2ray
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -28,9 +29,12 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.Locale
-import java.security.MessageDigest
 import kotlin.math.max
 
 enum class VpnScreen {
@@ -53,9 +57,11 @@ data class ConnectionTelemetryState(
     val elapsedSeconds: Long = 0L,
     val uploadBytes: Long = 0L,
     val downloadBytes: Long = 0L,
+    val uploadBytesPerSec: Long = 0L,
+    val downloadBytesPerSec: Long = 0L,
     val serverIpLabel: String = "—",
     val realPublicIpLabel: String = "Detecting…",
-    val realPublicCountryCode: String = "DE"
+    val realPublicCountryCode: String = "XX"
 ) {
     val formattedTimer: String
         get() {
@@ -70,6 +76,12 @@ data class ConnectionTelemetryState(
 
     val formattedDownload: String
         get() = formatByteCount(downloadBytes)
+
+    val formattedUploadSpeed: String
+        get() = "${formatByteCount(uploadBytesPerSec)}/s"
+
+    val formattedDownloadSpeed: String
+        get() = "${formatByteCount(downloadBytesPerSec)}/s"
 
     companion object {
         fun formatByteCount(bytes: Long): String {
@@ -115,6 +127,9 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private val _inspectingJsonServer = MutableStateFlow<ServerEntity?>(null)
     val inspectingJsonServer: StateFlow<ServerEntity?> = _inspectingJsonServer.asStateFlow()
 
+    private val _sharingQrServer = MutableStateFlow<ServerEntity?>(null)
+    val sharingQrServer: StateFlow<ServerEntity?> = _sharingQrServer.asStateFlow()
+
     val allServers: StateFlow<List<ServerEntity>> = dao.observeAllServers()
         .stateIn(
             scope = viewModelScope,
@@ -132,14 +147,17 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             ServerFilter.ALL -> {
                 protocolFiltered.sortedWith(
                     compareByDescending<ServerEntity> { it.isSelected }
-                        .thenBy { it.pingMs }
+                        .thenBy { if (it.pingMs > 0) it.pingMs else Int.MAX_VALUE }
                 )
             }
             ServerFilter.RECOMMENDED -> {
-                protocolFiltered.sortedBy { it.pingMs }.take(15)
+                protocolFiltered
+                    .sortedBy { if (it.pingMs > 0) it.pingMs else Int.MAX_VALUE }
+                    .take(15)
             }
             ServerFilter.LOW_PING -> {
-                val threshold = protocolFiltered.map { it.pingMs }.minOrNull()?.let { max(120, it + 45) } ?: 120
+                val minLive = protocolFiltered.filter { it.pingMs > 0 }.minOfOrNull { it.pingMs } ?: 120
+                val threshold = max(120, minLive + 45)
                 protocolFiltered.filter { it.pingMs in 1..threshold }.sortedBy { it.pingMs }
             }
             ServerFilter.HIGH_SPEED -> {
@@ -147,8 +165,9 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                     it.transport.equals("Reality", ignoreCase = true) ||
                         it.transport.equals("VLESS", ignoreCase = true) ||
                         it.transport.equals("gRPC", ignoreCase = true) ||
-                        it.transport.equals("WebSocket", ignoreCase = true)
-                }.sortedBy { it.pingMs }.take(15)
+                        it.transport.equals("WebSocket", ignoreCase = true) ||
+                        it.transport.equals("Hysteria2", ignoreCase = true)
+                }.sortedBy { if (it.pingMs > 0) it.pingMs else Int.MAX_VALUE }.take(15)
             }
         }
     }.stateIn(
@@ -168,38 +187,39 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             }
             "VMess (WebSocket)" -> servers.filter { it.protocolCore.contains("VMess", ignoreCase = true) }
             "Trojan (TLS)" -> servers.filter { it.protocolCore.contains("Trojan", ignoreCase = true) }
+            "Hysteria2" -> servers.filter { it.protocolCore.contains("Hysteria", ignoreCase = true) }
             "gRPC" -> servers.filter { it.transport.equals("gRPC", ignoreCase = true) }
             "Shadowsocks" -> servers.filter { it.protocolCore.contains("Shadowsocks", ignoreCase = true) }
             else -> servers
         }
     }
 
-    val selectedServer: StateFlow<ServerEntity?> = allServers.combine(_telemetry) { list, _ ->
-        list.firstOrNull { it.isSelected } ?: list.firstOrNull()
+    val selectedServer: StateFlow<ServerEntity?> = combine(allServers, _settings) { list, currentSettings ->
+        val matching = filterByProtocolPreference(list, currentSettings.protocolPreference)
+        matching.firstOrNull { it.isSelected }
+            ?: list.firstOrNull { it.isSelected }
+            ?: matching.firstOrNull()
+            ?: list.firstOrNull()
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5000),
         initialValue = null
     )
 
-    private var timerJob: Job? = null
     private var autoUpdateJob: Job? = null
     private var ipRefreshJob: Job? = null
-    private var baselineTxBytes: Long = 0L
-    private var baselineRxBytes: Long = 0L
+    private var connectJob: Job? = null
+    private var repingJob: Job? = null
 
     init {
         observeVpnServiceState()
         refreshRealPublicIp()
         initializeLiveServersOnStartup()
-        startRealTrafficTelemetryLoop()
         startSubscriptionAutoUpdateLoop()
     }
 
     /**
-     * Keeps UI connection state strictly synchronized with the real Android OS XrayVpnService.
-     * If the OS VPN service stops, fails to establish, or is revoked in system settings,
-     * the UI immediately shows Disconnected.
+     * Keeps UI connection state and Xray outbound traffic counters synchronized with XrayVpnService.
      */
     private fun observeVpnServiceState() {
         var wasRunning = false
@@ -207,15 +227,16 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             XrayVpnService.isServiceRunning.collect { running ->
                 if (running) {
                     wasRunning = true
-                    baselineTxBytes = readAppTxBytes()
-                    baselineRxBytes = readAppRxBytes()
+                    fletcher.evictConnectionPools()
                     _telemetry.update {
                         it.copy(
                             isConnected = true,
                             isConnecting = false,
                             elapsedSeconds = 0L,
                             uploadBytes = 0L,
-                            downloadBytes = 0L
+                            downloadBytes = 0L,
+                            uploadBytesPerSec = 0L,
+                            downloadBytesPerSec = 0L
                         )
                     }
                     // Verify live exit IP through the active tunnel once routes settle
@@ -228,11 +249,14 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                     _telemetry.update {
                         it.copy(
                             isConnected = false,
-                            isConnecting = false
+                            isConnecting = false,
+                            uploadBytesPerSec = 0L,
+                            downloadBytesPerSec = 0L
                         )
                     }
                     if (wasRunning) {
                         wasRunning = false
+                        fletcher.evictConnectionPools()
                         ipRefreshJob?.cancel()
                         ipRefreshJob = viewModelScope.launch {
                             delay(600L)
@@ -243,9 +267,35 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         viewModelScope.launch {
+            XrayVpnService.trafficSnapshot.collect { snapshot ->
+                if (_telemetry.value.isConnected && !_telemetry.value.isConnecting) {
+                    _telemetry.update {
+                        it.copy(
+                            elapsedSeconds = snapshot.elapsedSeconds,
+                            uploadBytes = snapshot.uploadBytes,
+                            downloadBytes = snapshot.downloadBytes,
+                            uploadBytesPerSec = snapshot.uploadBytesPerSec,
+                            downloadBytesPerSec = snapshot.downloadBytesPerSec
+                        )
+                    }
+                }
+            }
+        }
+        viewModelScope.launch {
             XrayVpnService.lastError.collect { err ->
                 if (!err.isNullOrBlank()) {
+                    if (!XrayVpnService.isServiceRunning.value) {
+                        _telemetry.update {
+                            it.copy(
+                                isConnecting = false,
+                                isConnected = false,
+                                uploadBytesPerSec = 0L,
+                                downloadBytesPerSec = 0L
+                            )
+                        }
+                    }
                     showMessage(err)
+                    XrayVpnService.clearLastError()
                 }
             }
         }
@@ -253,7 +303,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     fun refreshRealPublicIp() {
         viewModelScope.launch {
-            val (ip, country, code) = fletcher.fetchDevicePublicIpInfo()
+            val proxyPort = if (_telemetry.value.isConnected && !_settings.value.tunMode) 10808 else null
+            val (ip, country, code) = fletcher.fetchDevicePublicIpInfo(socksProxyPort = proxyPort)
             _telemetry.update {
                 it.copy(
                     realPublicIpLabel = "$ip · $country",
@@ -303,7 +354,11 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 val targetUrl = latestSub?.url?.takeIf { it.isNotBlank() } ?: current.activeSubscriptionUrl
 
                 if (lastFetched > 0L && System.currentTimeMillis() - lastFetched >= intervalMs && targetUrl.isNotBlank()) {
-                    val result = fletcher.fetchSubscriptionAndRankTop15(targetUrl)
+                    val result = fletcher.fetchSubscriptionAndRankTop15(
+                        subscriptionUrl = targetUrl,
+                        context = getApplication(),
+                        settings = current
+                    )
                     result.onSuccess { ranked ->
                         if (current.subReplaceExisting) {
                             dao.deleteFetchedServers()
@@ -338,55 +393,6 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Reads real Android OS TrafficStats TX/RX counters for this VPN UID while connected.
-     */
-    private fun startRealTrafficTelemetryLoop() {
-        timerJob?.cancel()
-        timerJob = viewModelScope.launch {
-            while (true) {
-                delay(1000L)
-                if (_telemetry.value.isConnected && !_telemetry.value.isConnecting) {
-                    val currentTx = readAppTxBytes()
-                    val currentRx = readAppRxBytes()
-                    val deltaTx = if (baselineTxBytes >= 0 && currentTx >= baselineTxBytes) {
-                        currentTx - baselineTxBytes
-                    } else 0L
-                    val deltaRx = if (baselineRxBytes >= 0 && currentRx >= baselineRxBytes) {
-                        currentRx - baselineRxBytes
-                    } else 0L
-
-                    _telemetry.update { state ->
-                        state.copy(
-                            elapsedSeconds = state.elapsedSeconds + 1,
-                            uploadBytes = deltaTx,
-                            downloadBytes = deltaRx
-                        )
-                    }
-                }
-            }
-        }
-    }
-
-    private fun readAppTxBytes(): Long {
-        val uidTx = safeTrafficStat { TrafficStats.getUidTxBytes(android.os.Process.myUid()) }
-        return if (uidTx > 0L) uidTx else safeTrafficStat { TrafficStats.getTotalTxBytes() }
-    }
-
-    private fun readAppRxBytes(): Long {
-        val uidRx = safeTrafficStat { TrafficStats.getUidRxBytes(android.os.Process.myUid()) }
-        return if (uidRx > 0L) uidRx else safeTrafficStat { TrafficStats.getTotalRxBytes() }
-    }
-
-    private fun safeTrafficStat(block: () -> Long): Long {
-        return try {
-            val v = block()
-            if (v == TrafficStats.UNSUPPORTED.toLong() || v < 0L) 0L else v
-        } catch (_: Exception) {
-            0L
-        }
-    }
-
     fun navigateTo(screen: VpnScreen) {
         if (_currentScreen.value == screen) return
         _screenStack.update { it + screen }
@@ -414,6 +420,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Selects a server without starting the VPN. Used while Android shows its consent dialog. */
     fun selectServer(server: ServerEntity, openConnectedScreen: Boolean = true) {
+        connectJob?.cancel()
+        connectJob = null
         viewModelScope.launch {
             dao.clearSelection()
             dao.markSelected(server.id)
@@ -422,7 +430,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun selectAndConnectServer(server: ServerEntity, openConnectedScreen: Boolean = true) {
-        viewModelScope.launch {
+        connectJob?.cancel()
+        connectJob = viewModelScope.launch {
             dao.clearSelection()
             dao.markSelected(server.id)
             if (openConnectedScreen) {
@@ -434,12 +443,16 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     fun toggleConnection() {
         if (_telemetry.value.isConnecting) {
+            connectJob?.cancel()
+            connectJob = null
             _telemetry.update { it.copy(isConnecting = false, isConnected = false) }
             stopAndroidVpnService()
             return
         }
         val currentlyConnected = _telemetry.value.isConnected
         if (currentlyConnected) {
+            connectJob?.cancel()
+            connectJob = null
             _telemetry.update {
                 it.copy(
                     isConnected = false,
@@ -459,7 +472,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 )
                 return
             }
-            viewModelScope.launch {
+            connectJob?.cancel()
+            connectJob = viewModelScope.launch {
                 connectToServer(active)
             }
         }
@@ -473,13 +487,26 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        XrayVpnService.clearLastError()
         _telemetry.update { it.copy(isConnecting = true) }
-        val livePing = withContext(Dispatchers.IO) {
-            fletcher.measureRealTcpLatencyOrNull(server.host, server.port, timeoutMs = 2200)
+
+        val isDirectOnly = _settings.value.routingMode.contains("Direct Only", ignoreCase = true)
+        val livePing: Int? = if (isDirectOnly) {
+            1
+        } else {
+            when (val probe = fletcher.measureRealXrayDelayOrNull(getApplication(), server, _settings.value)) {
+                is XrayProbeResult.Success -> probe.delayMs
+                XrayProbeResult.NativeUnavailable -> withContext(Dispatchers.IO) {
+                    fletcher.measureRealTcpLatencyOrNull(server.host, server.port, timeoutMs = 2200)
+                }
+                XrayProbeResult.Unreachable -> null
+            }
         }
+
+        currentCoroutineContext().ensureActive()
         if (livePing == null) {
             _telemetry.update { it.copy(isConnecting = false, isConnected = false) }
-            showMessage("${server.countryName} (${server.host}:${server.port}) did not respond to TCP handshake")
+            showMessage("${server.countryName} (${server.host}:${server.port}) failed Xray proxy verification")
             return
         }
 
@@ -490,6 +517,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             isSelected = true
         )
         dao.updateServer(updatedServer)
+        currentCoroutineContext().ensureActive()
 
         _telemetry.update { prev ->
             prev.copy(
@@ -501,8 +529,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Runs the real Fletcher Auto-Fetcher & Concurrent TCP Ping Ranker, saving the Top 15
-     * fastest reachable servers to the Room database.
+     * Runs the real Fletcher Auto-Fetcher & Concurrent Xray Ping Ranker, saving the Top 15
+     * fastest verified servers to the Room database.
      */
     fun runFletcherAutoFetchAndPingSweep(
         returnScreen: VpnScreen = VpnScreen.SERVER_LIST,
@@ -516,7 +544,11 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             val targetSubUrl = subs.firstOrNull()?.url?.takeIf { it.isNotBlank() }
                 ?: _settings.value.activeSubscriptionUrl
 
-            val subResult = fletcher.fetchSubscriptionAndRankTop15(targetSubUrl) { step ->
+            val subResult = fletcher.fetchSubscriptionAndRankTop15(
+                subscriptionUrl = targetSubUrl,
+                context = getApplication(),
+                settings = _settings.value
+            ) { step ->
                 _fetchingStatusMessage.value = step
             }
 
@@ -542,7 +574,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                         val ip = fletcher.resolveServerIpAddress(fastest.host)
                         _telemetry.update { it.copy(serverIpLabel = ip) }
                         showMessage(
-                            "Ranked Top ${withSelected.size} live servers · #1 ${fastest.countryName} (${fastest.pingMs} ms)"
+                            "Ranked Top ${withSelected.size} verified servers · #1 ${fastest.countryName} (${fastest.pingMs} ms)"
                         )
                     }
                 },
@@ -551,7 +583,11 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                     val existing = dao.getAllServersOnce()
                     if (existing.isNotEmpty()) {
                         _fetchingStatusMessage.value = "Re-testing saved servers…"
-                        val reRanked = fletcher.benchmarkAndRankTop15(existing) { step ->
+                        val reRanked = fletcher.benchmarkAndRankTop15(
+                            servers = existing,
+                            context = getApplication(),
+                            settings = _settings.value
+                        ) { step ->
                             _fetchingStatusMessage.value = step
                         }
                         if (reRanked.isNotEmpty()) {
@@ -578,15 +614,16 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     fun addAndFetchSubscriptionUrl(rawUrlOrLinks: String) {
         val input = rawUrlOrLinks.trim()
         if (input.isBlank()) {
-            showMessage("Please enter a valid V2Ray subscription URL or URI link")
+            showMessage("Please enter a valid subscription URL or server link")
             return
         }
 
-        if (input.startsWith("vmess://") ||
+            if (input.startsWith("vmess://") ||
             input.startsWith("vless://") ||
             input.startsWith("trojan://") ||
             input.startsWith("ss://") ||
             input.startsWith("hy2://") ||
+            input.startsWith("hysteria2://") ||
             input.startsWith("{")
         ) {
             importFromTextOrClipboard(input)
@@ -607,7 +644,11 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 )
             )
 
-            val fetchResult = fletcher.fetchSubscriptionAndRankTop15(input) { status ->
+            val fetchResult = fletcher.fetchSubscriptionAndRankTop15(
+                subscriptionUrl = input,
+                context = getApplication(),
+                settings = _settings.value
+            ) { status ->
                 _fetchingStatusMessage.value = status
             }
 
@@ -628,7 +669,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     _currentScreen.value = VpnScreen.SERVER_LIST
                     showMessage(
-                        "Fetched & ranked Top ${marked.size} live servers! Fastest: ${fastest?.countryName ?: ""} (${fastest?.pingMs ?: 0} ms)"
+                        "Fetched & ranked Top ${marked.size} verified servers! Fastest: ${fastest?.countryName ?: ""} (${fastest?.pingMs ?: 0} ms)"
                     )
                 },
                 onFailure = { err ->
@@ -640,24 +681,28 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Imports V2Ray/Xray servers from clipboard text and runs real TCP latency tests.
+     * Imports V2Ray/Xray servers from clipboard text and runs real Xray outbound latency checks.
      */
     fun importFromTextOrClipboard(rawText: String) {
         val trimmed = rawText.trim()
         if (trimmed.isBlank()) {
-            showMessage("Clipboard is empty — copy a vless://, vmess://, trojan://, ss://, or Xray JSON config first")
+            showMessage("Clipboard is empty — copy a vless://, vmess://, trojan://, ss://, hy2://, or JSON config first")
             return
         }
         viewModelScope.launch {
             val parsed = fletcher.parseImportPayload(trimmed, isCustom = true)
             if (parsed.isEmpty()) {
-                showMessage("No valid V2Ray URI or Xray JSON found in clipboard")
+                showMessage("No valid supported server link or JSON config found")
                 return@launch
             }
-            showMessage("Testing latency for ${parsed.size} imported server(s)…")
-            val benchmarked = fletcher.benchmarkAndRankTop15(parsed)
+            showMessage("Verifying latency for ${parsed.size} imported server(s)…")
+            val benchmarked = fletcher.benchmarkAndRankTop15(
+                servers = parsed,
+                context = getApplication(),
+                settings = _settings.value
+            )
             if (benchmarked.isEmpty()) {
-                showMessage("Parsed ${parsed.size} server(s), but none responded to TCP ping")
+                showMessage("Parsed ${parsed.size} server(s), but none passed Xray proxy verification")
                 return@launch
             }
             dao.clearSelection()
@@ -667,12 +712,12 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             dao.insertServers(toInsert)
             navigateTo(VpnScreen.SERVER_LIST)
             val best = toInsert.first()
-            showMessage("Imported ${toInsert.size} live server(s) · Fastest: ${best.countryName} (${best.pingMs} ms)")
+            showMessage("Imported ${toInsert.size} verified server(s) · Fastest: ${best.countryName} (${best.pingMs} ms)")
         }
     }
 
     /**
-     * Validates, pings, and saves a manual custom V2Ray/Xray server or Raw Xray JSON configuration.
+     * Validates, verifies via Xray outbound probe, and saves a manual custom V2Ray/Xray server or Raw Xray JSON config.
      */
     fun addManualCustomServer(
         countryName: String,
@@ -682,28 +727,31 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         transport: String,
         uuidOrPassword: String,
         sni: String,
-        rawJsonInput: String
+        rawJsonInput: String,
+        publicKey: String = "",
+        shortId: String = "",
+        wsPath: String = "",
+        wsHost: String = "",
+        grpcServiceName: String = ""
     ) {
         viewModelScope.launch {
             if (rawJsonInput.trim().startsWith("{")) {
                 val parsedFromJson = fletcher.parseRawXrayJson(rawJsonInput.trim(), isCustom = true)
                 if (parsedFromJson.isEmpty()) {
-                    showMessage("Invalid Xray JSON configuration — check outbounds syntax")
+                    showMessage("Invalid JSON configuration — check outbounds syntax")
                     return@launch
                 }
                 val candidate = parsedFromJson.first()
-                val livePing = withContext(Dispatchers.IO) {
-                    fletcher.measureRealTcpLatencyOrNull(candidate.host, candidate.port, 2000)
-                }
-                if (livePing == null) {
-                    showMessage("Server ${candidate.host}:${candidate.port} is unreachable (TCP timeout)")
+                val verifiedPing = verifyServerLatencyOrNull(candidate)
+                if (verifiedPing == null) {
+                    showMessage("Server ${candidate.host}:${candidate.port} failed proxy verification")
                     return@launch
                 }
                 dao.clearSelection()
-                val verified = candidate.copy(pingMs = livePing, isSelected = true)
+                val verified = candidate.copy(pingMs = verifiedPing, isSelected = true)
                 dao.insertServer(verified)
                 navigateTo(VpnScreen.SERVER_LIST)
-                showMessage("Added custom Xray JSON server (${verified.countryName} · $livePing ms)")
+                showMessage("Added custom server (${verified.countryName} · $verifiedPing ms)")
                 return@launch
             }
 
@@ -717,78 +765,125 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
 
-            showMessage("Testing TCP connection to $cleanHost:$port…")
-            val livePing = withContext(Dispatchers.IO) {
-                fletcher.measureRealTcpLatencyOrNull(cleanHost, port, 2000)
+            val normalizedProtocol = if (protocol.contains("Hysteria", ignoreCase = true)) {
+                "Hysteria2 (Xray)"
+            } else if (protocol.contains("Shadowsocks", ignoreCase = true)) {
+                "Shadowsocks (Xray)"
+            } else {
+                "$protocol (V2Ray)"
             }
-            if (livePing == null) {
-                showMessage("Host $cleanHost:$port did not respond to TCP ping")
-                return@launch
+            val normalizedTransport = when {
+                protocol.contains("Hysteria", ignoreCase = true) -> "Hysteria2"
+                transport.equals("WS", ignoreCase = true) -> "WebSocket"
+                else -> transport
             }
 
             val baseServer = ServerEntity(
                 countryName = countryName.trim(),
-                countryCode = "DE",
-                protocolDisplay = "V2Ray · $transport",
-                protocolCore = "$protocol (V2Ray)",
-                transport = transport,
+                countryCode = "XX",
+                protocolDisplay = "V2Ray · $normalizedTransport",
+                protocolCore = normalizedProtocol,
+                transport = normalizedTransport,
                 host = cleanHost,
                 port = port.coerceIn(1, 65535),
                 uuidOrPassword = uuidOrPassword.trim(),
                 sni = sni.trim(),
-                pingMs = livePing,
+                publicKey = publicKey.trim(),
+                pingMs = 0,
                 isRecommendedTop15 = true,
                 rankOrder = 1,
                 isSelected = true,
                 isCustom = true
             )
-            val enriched = fletcher.enrichServerWithIpAndCountry(baseServer, rank = 1)
-            val finalServer = if (countryName.trim().isNotBlank()) {
-                enriched.copy(countryName = countryName.trim())
-            } else {
-                enriched
-            }
-            val withJson = finalServer.copy(
-                rawConfigJson = fletcher.generateXrayJsonForServer(finalServer)
+            val generatedJson = fletcher.generateXrayJsonForServer(
+                server = baseServer,
+                wsPath = wsPath.trim(),
+                wsHost = wsHost.trim(),
+                grpcServiceName = grpcServiceName.trim(),
+                shortId = shortId.trim()
             )
+            val testableServer = baseServer.copy(rawConfigJson = generatedJson)
+
+            showMessage("Verifying proxy connection to $cleanHost:$port…")
+            val verifiedPing = verifyServerLatencyOrNull(testableServer)
+            if (verifiedPing == null) {
+                showMessage("Host $cleanHost:$port failed Xray proxy handshake")
+                return@launch
+            }
+
+            val enriched = fletcher.enrichServerWithIpAndCountry(
+                testableServer.copy(pingMs = verifiedPing),
+                rank = 1
+            )
+            val finalServer = if (countryName.trim().isNotBlank()) {
+                enriched.copy(countryName = countryName.trim(), rawConfigJson = generatedJson)
+            } else {
+                enriched.copy(rawConfigJson = generatedJson)
+            }
             dao.clearSelection()
-            dao.insertServer(withJson)
+            dao.insertServer(finalServer)
             navigateTo(VpnScreen.SERVER_LIST)
-            showMessage("Added ${withJson.countryName} · ${withJson.resolvedIp} ($livePing ms)")
+            showMessage("Added ${finalServer.countryName} · ${finalServer.resolvedIp} ($verifiedPing ms)")
         }
     }
 
     fun pingSingleServer(server: ServerEntity) {
         viewModelScope.launch {
-            val livePing = measureV2RayOutboundDelayOrNull(server)
+            val livePing = verifyServerLatencyOrNull(server)
             if (livePing != null) {
                 dao.updateServer(server.copy(pingMs = livePing))
-                showMessage("${server.countryName} Xray ping: $livePing ms")
+                showMessage("${server.countryName} verified: $livePing ms")
             } else {
-                showMessage("${server.countryName} (${server.host}:${server.port}) did not respond")
+                dao.updateServer(server.copy(pingMs = 0))
+                showMessage("${server.countryName} (${server.host}:${server.port}) failed proxy handshake")
             }
         }
     }
 
-    /** Same native outbound-delay probe used by v2rayNG, against its standard 204 endpoint. */
-    private suspend fun measureV2RayOutboundDelayOrNull(server: ServerEntity): Int? = withContext(Dispatchers.IO) {
-        try {
-            val app = getApplication<Application>()
-            Seq.setContext(app)
-            val androidId = Settings.Secure.getString(app.contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
-            val deviceId = Base64.encodeToString(
-                MessageDigest.getInstance("SHA-256").digest(androidId.toByteArray()).copyOf(32),
-                Base64.NO_PADDING or Base64.URL_SAFE or Base64.NO_WRAP
-            )
-            val assetPath = (app.getExternalFilesDir("assets") ?: app.getDir("assets", 0)).absolutePath
-            Libv2ray.initCoreEnv(assetPath, deviceId)
-            val baseConfig = server.rawConfigJson.ifBlank { fletcher.generateXrayJsonForServer(server) }
-            val runtimeConfig = fletcher.applyRuntimeSettingsToXrayJson(baseConfig, _settings.value)
-            val delay = Libv2ray.measureOutboundDelay(runtimeConfig, "https://www.gstatic.com/generate_204")
-            if (delay > 0L) delay.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
-            else fletcher.measureRealTcpLatencyOrNull(server.host, server.port, 1800)
-        } catch (_: Throwable) {
-            fletcher.measureRealTcpLatencyOrNull(server.host, server.port, 1800)
+    fun repingAllSavedServers() {
+        if (repingJob?.isActive == true) {
+            showMessage("Speed test already in progress…")
+            return
+        }
+        repingJob = viewModelScope.launch {
+            val existing = dao.getAllServersOnce()
+            if (existing.isEmpty()) {
+                showMessage("No saved servers to test")
+                return@launch
+            }
+            showMessage("Testing ${existing.size} saved server(s)…")
+            val semaphore = Semaphore(8)
+            val updated = coroutineScope {
+                existing.map { server ->
+                    async {
+                        semaphore.withPermit {
+                            val ping = verifyServerLatencyOrNull(server) ?: 0
+                            val updatedEntity = server.copy(pingMs = ping)
+                            dao.updateServer(updatedEntity)
+                            updatedEntity
+                        }
+                    }
+                }.awaitAll()
+            }
+            val reachable = updated.filter { it.pingMs > 0 }
+            val fastest = reachable.minByOrNull { it.pingMs }
+            if (fastest != null) {
+                showMessage(
+                    "Verified ${reachable.size}/${existing.size} servers · Fastest: ${fastest.countryName} (${fastest.pingMs} ms)"
+                )
+            } else {
+                showMessage("Tested ${existing.size} server(s), none passed proxy check")
+            }
+        }
+    }
+
+    private suspend fun verifyServerLatencyOrNull(server: ServerEntity): Int? {
+        return when (val probe = fletcher.measureRealXrayDelayOrNull(getApplication(), server, _settings.value)) {
+            is XrayProbeResult.Success -> probe.delayMs
+            XrayProbeResult.NativeUnavailable -> withContext(Dispatchers.IO) {
+                fletcher.measureRealTcpLatencyOrNull(server.host, server.port, 1800)
+            }
+            XrayProbeResult.Unreachable -> null
         }
     }
 
@@ -797,6 +892,57 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             dao.deleteServerById(server.id)
             showMessage("Removed ${server.countryName}")
         }
+    }
+
+    fun openQrShare(server: ServerEntity) {
+        val raw = server.rawConfigJson.ifBlank { fletcher.generateXrayJsonForServer(server) }
+        _sharingQrServer.value = server.copy(rawConfigJson = raw)
+    }
+
+    fun closeQrShare() {
+        _sharingQrServer.value = null
+    }
+
+    fun buildExportBackupPayload(servers: List<ServerEntity> = allServers.value): String =
+        Companion.buildExportBackupPayload(servers, fletcher)
+
+    companion object {
+        fun buildExportBackupPayload(
+            servers: List<ServerEntity>,
+            fletcher: V2RayParserAndFletcher = V2RayParserAndFletcher()
+        ): String {
+            if (servers.isEmpty()) return ""
+            val uris = servers.mapNotNull { it.shareUri.trim().takeIf { u -> u.isNotEmpty() } }
+            if (uris.isNotEmpty() && uris.size == servers.size) {
+                return uris.joinToString("\n")
+            }
+            if (uris.isNotEmpty() && servers.none { it.rawConfigJson.isNotBlank() }) {
+                return uris.joinToString("\n")
+            }
+            val outbounds = JSONArray()
+            servers.forEach { server ->
+                val raw = server.rawConfigJson.ifBlank { fletcher.generateXrayJsonForServer(server) }
+                try {
+                    val root = JSONObject(raw)
+                    val obs = root.optJSONArray("outbounds")
+                    if (obs != null && obs.length() > 0) {
+                        val primary = obs.optJSONObject(0)
+                        if (primary != null) outbounds.put(primary)
+                    }
+                } catch (_: Exception) {
+                }
+            }
+            return if (outbounds.length() > 0) {
+                JSONObject().put("outbounds", outbounds).toString(2)
+            } else {
+                uris.joinToString("\n")
+            }
+        }
+    }
+
+    fun clearXrayLogs() {
+        XrayVpnService.clearLogs()
+        showMessage("Cleared Xray diagnostic logs")
     }
 
     fun openJsonInspector(server: ServerEntity) {
@@ -809,10 +955,35 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun saveEditedServerJson(server: ServerEntity, updatedJson: String) {
+        val validationError = validateXrayConfigJson(updatedJson)
+        if (validationError != null) {
+            showMessage(validationError)
+            return
+        }
         viewModelScope.launch {
-            dao.updateServer(server.copy(rawConfigJson = updatedJson))
+            dao.updateServer(server.copy(rawConfigJson = updatedJson.trim()))
             _inspectingJsonServer.value = null
-            showMessage("Saved Xray JSON config for ${server.countryName}")
+            showMessage("Saved config for ${server.countryName}")
+        }
+    }
+
+    private fun validateXrayConfigJson(rawJson: String): String? {
+        return try {
+            val root = JSONObject(rawJson.trim())
+            val outbounds: JSONArray? = root.optJSONArray("outbounds")
+            if (outbounds == null || outbounds.length() == 0) {
+                return "Invalid Xray JSON: missing 'outbounds' array"
+            }
+            val hasProxyOutbound = (0 until outbounds.length()).any { idx ->
+                val proto = outbounds.optJSONObject(idx)?.optString("protocol", "").orEmpty().lowercase()
+                proto.isNotBlank() && proto !in listOf("freedom", "blackhole", "dns", "direct", "block")
+            }
+            if (!hasProxyOutbound) {
+                return "Invalid Xray JSON: at least one proxy outbound is required"
+            }
+            null
+        } catch (e: Exception) {
+            "Invalid JSON syntax: ${e.message ?: "parse error"}"
         }
     }
 
@@ -825,7 +996,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun cycleUpdateInterval() {
-        val intervals = listOf("15 min", "30 min", "1 hour", "6 hours", "12 hours")
+        val intervals = listOf("15 min", "30 min", "1 hour", "6 hours", "12 hours", "24 hours")
         updateSettings { current ->
             val nextIdx = (intervals.indexOf(current.updateIntervalLabel) + 1) % intervals.size
             val next = intervals[nextIdx]
@@ -834,7 +1005,16 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun cycleProtocolPreference() {
-        val options = listOf("Auto (V2Ray)", "VLESS (Reality)", "VMess (WebSocket)", "Trojan (TLS)", "Xray Custom JSON")
+        val options = listOf(
+            "Auto (V2Ray)",
+            "VLESS (Reality)",
+            "VLESS (WS / TCP)",
+            "VMess (WebSocket)",
+            "Trojan (TLS)",
+            "Hysteria2",
+            "gRPC",
+            "Shadowsocks"
+        )
         updateSettings { current ->
             val nextIdx = (options.indexOf(current.protocolPreference) + 1) % options.size
             current.copy(protocolPreference = options[nextIdx])
@@ -842,7 +1022,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun cycleRoutingMode() {
-        val options = listOf("Global", "Bypass LAN", "Bypass Mainland & LAN", "Direct Only")
+        val options = listOf("Global", "Bypass LAN", "Bypass LAN & Domestic", "Direct Only")
         updateSettings { current ->
             val nextIdx = (options.indexOf(current.routingMode) + 1) % options.size
             current.copy(routingMode = options[nextIdx])
@@ -850,7 +1030,13 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun cycleDnsMode() {
-        val options = listOf("Auto (DoH)", "Cloudflare 1.1.1.1", "Google 8.8.8.8", "Quad9 9.9.9.9")
+        val options = listOf(
+            "Auto (DoH)",
+            "Cloudflare 1.1.1.1",
+            "Google 8.8.8.8",
+            "Quad9 9.9.9.9",
+            "AdGuard 94.140.14.14"
+        )
         updateSettings { current ->
             val nextIdx = (options.indexOf(current.dnsMode) + 1) % options.size
             current.copy(dnsMode = options[nextIdx])
@@ -858,8 +1044,11 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun clearServerCacheAndReset() {
+        connectJob?.cancel()
+        connectJob = null
         viewModelScope.launch {
             stopAndroidVpnService()
+            prefsStore.clearActiveTunnelSnapshot()
             _telemetry.value = ConnectionTelemetryState()
             dao.deleteAllServers()
             showMessage("Cleared all cached servers")

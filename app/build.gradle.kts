@@ -10,6 +10,10 @@ plugins {
   alias(libs.plugins.google.services)
 }
 
+val isReleaseOrBundleTask = gradle.startParameter.taskNames.any {
+  it.contains("Release", ignoreCase = true) || it.contains("bundle", ignoreCase = true)
+}
+
 android {
   namespace = "com.hollow.vpn"
   compileSdk { version = release(36) { minorApiLevel = 1 } }
@@ -19,8 +23,11 @@ android {
     minSdk = 24
     targetSdk = 36
     // Release artifacts are split like v2rayNG: 32-bit ARM, 64-bit ARM, and universal ARM.
-    ndk {
-      abiFilters += listOf("armeabi-v7a", "arm64-v8a")
+    // Debug builds keep all ABIs (including x86_64) and output standard app-debug.apk for preview.
+    if (isReleaseOrBundleTask) {
+      ndk {
+        abiFilters += listOf("armeabi-v7a", "arm64-v8a")
+      }
     }
     versionCode = 1
     versionName = "1.0"
@@ -30,7 +37,7 @@ android {
 
   splits {
     abi {
-      isEnable = true
+      isEnable = isReleaseOrBundleTask
       reset()
       include("armeabi-v7a", "arm64-v8a")
       isUniversalApk = true

@@ -34,7 +34,6 @@ import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.QrCodeScanner
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -58,18 +57,23 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.width
+import androidx.compose.material.icons.outlined.ContentCopy
+import androidx.compose.material3.Surface
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.FilterQuality
+import com.hollow.vpn.data.ServerEntity
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.BinaryBitmap
 import com.google.zxing.DecodeHintType
+import com.google.zxing.EncodeHintType
 import com.google.zxing.MultiFormatReader
 import com.google.zxing.PlanarYUVLuminanceSource
 import com.google.zxing.RGBLuminanceSource
 import com.google.zxing.common.HybridBinarizer
-import com.hollow.vpn.ui.theme.ForestEmerald
-import com.hollow.vpn.ui.theme.PureWhiteCard
-import com.hollow.vpn.ui.theme.TextPrimaryDark
-import com.hollow.vpn.ui.theme.TextSecondaryMuted
+import com.google.zxing.qrcode.QRCodeWriter
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -78,8 +82,8 @@ fun CameraQrScannerDialog(
     onQrDecoded: (String) -> Unit,
     onDismiss: () -> Unit
 ) {
+    val scheme = MaterialTheme.colorScheme
     val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
     var hasCameraPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
@@ -118,13 +122,10 @@ fun CameraQrScannerDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        containerColor = PureWhiteCard,
-        shape = RoundedCornerShape(24.dp),
         title = {
             Text(
-                text = "Scan V2Ray QR Code",
-                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                color = TextPrimaryDark
+                text = "Scan Server QR Code",
+                style = MaterialTheme.typography.titleLarge
             )
         },
         text = {
@@ -135,13 +136,14 @@ fun CameraQrScannerDialog(
             ) {
                 if (hasCameraPermission) {
                     CameraQrPreviewBox(
+                        accentColor = scheme.primary,
                         onDecoded = onQrDecoded,
                         onCameraError = { msg -> scanError = msg }
                     )
                     Text(
                         text = "Point camera at a vless://, vmess://, trojan://, or ss:// QR code",
                         style = MaterialTheme.typography.bodySmall,
-                        color = TextSecondaryMuted,
+                        color = scheme.onSurfaceVariant,
                         textAlign = TextAlign.Center
                     )
                 } else {
@@ -149,8 +151,8 @@ fun CameraQrScannerDialog(
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(180.dp)
-                            .clip(RoundedCornerShape(18.dp))
-                            .background(Color(0xFFF1F3F4)),
+                            .clip(RoundedCornerShape(20.dp))
+                            .background(scheme.surfaceContainerHigh),
                         contentAlignment = Alignment.Center
                     ) {
                         Column(
@@ -161,18 +163,17 @@ fun CameraQrScannerDialog(
                             Icon(
                                 imageVector = Icons.Outlined.QrCodeScanner,
                                 contentDescription = null,
-                                tint = ForestEmerald,
+                                tint = scheme.primary,
                                 modifier = Modifier.size(36.dp)
                             )
                             Text(
                                 text = scanError ?: "Allow camera access to scan QR codes live.",
                                 style = MaterialTheme.typography.bodySmall,
-                                color = TextSecondaryMuted,
+                                color = scheme.onSurfaceVariant,
                                 textAlign = TextAlign.Center
                             )
                             Button(
                                 onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) },
-                                colors = ButtonDefaults.buttonColors(containerColor = ForestEmerald),
                                 modifier = Modifier.testTag("btn_grant_camera_permission")
                             ) {
                                 Text("Enable Camera")
@@ -185,7 +186,7 @@ fun CameraQrScannerDialog(
                     Text(
                         text = scanError.orEmpty(),
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
+                        color = scheme.error,
                         textAlign = TextAlign.Center
                     )
                 }
@@ -213,7 +214,7 @@ fun CameraQrScannerDialog(
         confirmButton = {},
         dismissButton = {
             TextButton(onClick = onDismiss) {
-                Text("Cancel", color = TextSecondaryMuted)
+                Text("Cancel")
             }
         }
     )
@@ -221,6 +222,7 @@ fun CameraQrScannerDialog(
 
 @Composable
 private fun CameraQrPreviewBox(
+    accentColor: Color,
     onDecoded: (String) -> Unit,
     onCameraError: (String) -> Unit
 ) {
@@ -293,7 +295,7 @@ private fun CameraQrPreviewBox(
             modifier = Modifier
                 .align(Alignment.Center)
                 .size(164.dp)
-                .border(2.dp, Color.White.copy(alpha = 0.85f), RoundedCornerShape(16.dp))
+                .border(2.5.dp, accentColor.copy(alpha = 0.92f), RoundedCornerShape(18.dp))
         )
     }
 }
@@ -373,4 +375,133 @@ fun decodeQrFromBitmap(bitmap: Bitmap): String? {
     } catch (_: Exception) {
         null
     }
+}
+
+fun generateQrBitmap(payload: String, sizePx: Int = 512): Bitmap? {
+    val clean = payload.trim()
+    if (clean.isEmpty() || clean.length > 2900) return null
+    return try {
+        val hints = mapOf(
+            EncodeHintType.CHARACTER_SET to "UTF-8",
+            EncodeHintType.MARGIN to 1
+        )
+        val matrix = QRCodeWriter().encode(clean, BarcodeFormat.QR_CODE, sizePx, sizePx, hints)
+        val width = matrix.width
+        val height = matrix.height
+        val pixels = IntArray(width * height)
+        for (y in 0 until height) {
+            val offset = y * width
+            for (x in 0 until width) {
+                pixels[offset + x] = if (matrix.get(x, y)) android.graphics.Color.BLACK else android.graphics.Color.WHITE
+            }
+        }
+        Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).apply {
+            setPixels(pixels, 0, width, 0, 0, width, height)
+        }
+    } catch (_: Exception) {
+        null
+    }
+}
+
+@Composable
+fun ServerQrShareDialog(
+    server: ServerEntity,
+    onCopyPayload: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val scheme = MaterialTheme.colorScheme
+    val sharePayload = remember(server) {
+        server.shareUri.ifBlank { server.rawConfigJson }
+    }
+    val qrBitmap = remember(sharePayload) {
+        generateQrBitmap(sharePayload, sizePx = 560)
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = scheme.surfaceContainerHigh,
+        shape = RoundedCornerShape(28.dp),
+        title = {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                CircularCountryFlag(countryCode = server.countryCode, size = 28.dp)
+                Column {
+                    Text(
+                        text = server.countryName,
+                        style = MaterialTheme.typography.titleLarge,
+                        color = scheme.onSurface
+                    )
+                    Text(
+                        text = "${server.protocolCore} · ${server.resolvedIp.ifBlank { server.host }}:${server.port}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = scheme.onSurfaceVariant
+                    )
+                }
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                if (qrBitmap != null) {
+                    Surface(
+                        shape = RoundedCornerShape(20.dp),
+                        color = Color.White,
+                        tonalElevation = 0.dp
+                    ) {
+                        Image(
+                            bitmap = qrBitmap.asImageBitmap(),
+                            contentDescription = "QR code for ${server.countryName}",
+                            filterQuality = FilterQuality.None,
+                            modifier = Modifier
+                                .padding(14.dp)
+                                .size(220.dp)
+                                .testTag("server_qr_image")
+                        )
+                    }
+                    Text(
+                        text = if (server.shareUri.isNotBlank()) {
+                            "Scan this QR code with Hollow VPN or another Xray client."
+                        } else {
+                            "Encoded raw Xray config as a QR code."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = scheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center
+                    )
+                } else {
+                    Text(
+                        text = "This config is too large for a single QR code. Use Copy Config instead.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = scheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { onCopyPayload(sharePayload) },
+                enabled = sharePayload.isNotBlank(),
+                modifier = Modifier.testTag("btn_copy_qr_payload")
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.ContentCopy,
+                    contentDescription = null,
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(if (server.shareUri.isNotBlank()) "Copy Share Link" else "Copy Config")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Close")
+            }
+        }
+    )
 }

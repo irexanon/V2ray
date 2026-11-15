@@ -4,7 +4,7 @@
     <string name="fetching_servers_title">Fetching servers…</string>
     <string name="auto_configuring_subtitle">Auto configuring for you</string>
     <string name="vpn_header_title">VPN</string>
-    <string name="vpn_header_subtitle">Auto fetched servers</string>
+    <string name="vpn_header_subtitle">Fastest verified locations</string>
     <string name="filter_all">All</string>
     <string name="filter_recommended">Recommended</string>
     <string name="filter_low_ping">Low Ping</string>
@@ -24,11 +24,11 @@
     <string name="section_connection">Connection</string>
     <string name="section_app">App</string>
     <string name="setting_auto_configure">Auto Configure</string>
-    <string name="setting_auto_configure_sub">Fetch and configure servers automatically</string>
+    <string name="setting_auto_configure_sub">Fetch and optimize servers automatically</string>
     <string name="setting_update_interval">Update Interval</string>
     <string name="setting_update_interval_sub">Refresh server list automatically</string>
     <string name="setting_custom_subscription">Custom Subscription</string>
-    <string name="setting_custom_subscription_sub">Add your V2Ray subscription link</string>
+    <string name="setting_custom_subscription_sub">Add your server subscription link</string>
     <string name="setting_protocol">Protocol</string>
     <string name="setting_routing_mode">Routing Mode</string>
     <string name="setting_dns">DNS</string>
@@ -46,11 +46,11 @@
     <string name="tab_subscription">Subscription</string>
     <string name="tab_manual">Manual</string>
     <string name="tab_qr_code">QR Code</string>
-    <string name="label_subscription_link">V2Ray Subscription Link</string>
+    <string name="label_subscription_link">Subscription Link</string>
     <string name="hint_subscription_url">https://example.com/sub</string>
     <string name="action_add_and_fetch">Add &amp; Fetch</string>
     <string name="action_import_clipboard">Import from Clipboard</string>
-    <string name="action_import_clipboard_sub">Paste V2Ray link from clipboard</string>
+    <string name="action_import_clipboard_sub">Paste server link or config from clipboard</string>
     <string name="section_subscription_options">Subscription Options</string>
     <string name="setting_auto_update">Auto Update</string>
     <string name="setting_replace_existing">Replace Existing</string>
