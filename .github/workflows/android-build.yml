@@ -77,6 +77,25 @@ jobs:
             cp .env.example .env
           fi
 
+      - name: Cache Robolectric android-all runtime
+        id: cache-robolectric
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository/org/robolectric/android-all-instrumented
+          key: robolectric-android-all-16-robolectric-13921718-i7
+
+      - name: Pre-download Robolectric SDK 36 runtime if missing
+        if: steps.cache-robolectric.outputs.cache-hit != 'true'
+        run: |
+          ROBO_VER="16-robolectric-13921718-i7"
+          ROBO_DIR="$HOME/.m2/repository/org/robolectric/android-all-instrumented/$ROBO_VER"
+          BASE_URL="https://repo1.maven.org/maven2/org/robolectric/android-all-instrumented/$ROBO_VER"
+          mkdir -p "$ROBO_DIR"
+          for ext in pom pom.sha512 jar jar.sha512; do
+            FILE="android-all-instrumented-${ROBO_VER}.${ext}"
+            curl -fSL --retry 5 --retry-all-errors --connect-timeout 20 -o "$ROBO_DIR/$FILE" "$BASE_URL/$FILE"
+          done
+
       - name: Run unit and Robolectric tests
         run: gradle testDebugUnitTest --stacktrace
 

@@ -1698,41 +1698,27 @@ fun HollowVpnLogoCard(
         color = HollowInk
     ) {
         Box(
-            modifier = Modifier.fillMaxSize(),
-            contentAlignment = Alignment.Center
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(18.dp)
         ) {
-            Canvas(
+            Box(
                 modifier = Modifier
-                    .fillMaxSize()
-                    .padding(19.dp)
-            ) {
-                val w = size.width
-                val h = size.height
-
-                val upperWing = Path().apply {
-                    moveTo(w * 0.06f, h * 0.46f)
-                    lineTo(w * 0.94f, h * 0.10f)
-                    lineTo(w * 0.50f, h * 0.55f)
-                    close()
-                }
-                drawPath(path = upperWing, color = HollowOrange)
-
-                val centerFold = Path().apply {
-                    moveTo(w * 0.50f, h * 0.55f)
-                    lineTo(w * 0.94f, h * 0.10f)
-                    lineTo(w * 0.42f, h * 0.84f)
-                    close()
-                }
-                drawPath(path = centerFold, color = HollowCream)
-
-                val lowerWing = Path().apply {
-                    moveTo(w * 0.50f, h * 0.55f)
-                    lineTo(w * 0.94f, h * 0.10f)
-                    lineTo(w * 0.72f, h * 0.90f)
-                    close()
-                }
-                drawPath(path = lowerWing, color = Color(0xFFB5AFA4))
-            }
+                    .size(cardSize * 0.17f)
+                    .align(Alignment.TopStart)
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(HollowOrange)
+            )
+            Text(
+                text = "H",
+                fontFamily = SpaceGroteskFamily,
+                fontWeight = FontWeight.Bold,
+                fontSize = (cardSize.value * 0.44f).sp,
+                color = HollowCream,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .offset(x = (-2).dp, y = 4.dp)
+            )
         }
     }
 }
