@@ -373,6 +373,7 @@ private fun DisconnectedHomeContent(
             .padding(horizontal = 24.dp)
     ) {
         val isCompact = maxHeight < 620.dp
+        val screenMaxHeight = maxHeight
 
         // Slider + stats stay pinned to the bottom; only the top area scrolls on very small phones
         Column(modifier = Modifier.fillMaxSize()) {
@@ -453,7 +454,7 @@ private fun DisconnectedHomeContent(
                     targetCountryName = selectedServer?.countryName,
                     tunModeEnabled = tunModeEnabled,
                     // map shrinks to whatever height is left (~100 dp on a 393x864 phone), never overflowing
-                    mapHeight = (maxHeight - 631.dp).coerceIn(72.dp, 140.dp)
+                    mapHeight = (screenMaxHeight - 631.dp).coerceIn(72.dp, 140.dp)
                 )
             }
 
