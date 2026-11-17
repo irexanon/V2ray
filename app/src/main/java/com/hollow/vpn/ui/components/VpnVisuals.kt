@@ -384,8 +384,8 @@ fun HollowSlideActionPill(
     val density = LocalDensity.current
     val haptic = LocalHapticFeedback.current
     val scope = rememberCoroutineScope()
-    val thumbSize = 54.dp
-    val trackPadding = 7.dp
+    val thumbSize = 56.dp
+    val trackPadding = 6.dp
 
     BoxWithConstraints(
         modifier = modifier
@@ -401,6 +401,15 @@ fun HollowSlideActionPill(
         }
         val offsetX = remember(label) { Animatable(0f) }
         val progress = (offsetX.value / maxOffsetPx).coerceIn(0f, 1f)
+        // Idle hint: the thumb gently nudges forward so it is obvious the pill must be slid
+        val nudgeTransition = rememberInfiniteTransition(label = "slide_nudge")
+        val nudgePx by nudgeTransition.animateFloat(
+            initialValue = 0f,
+            targetValue = with(density) { 14.dp.toPx() },
+            animationSpec = infiniteRepeatable(tween(800, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+            label = "slide_nudge_px"
+        )
+        val nudgeFactor = (1f - progress * 10f).coerceIn(0f, 1f)
 
         Text(
             text = label,
@@ -421,7 +430,7 @@ fun HollowSlideActionPill(
             modifier = Modifier
                 .align(Alignment.CenterStart)
                 .padding(horizontal = trackPadding)
-                .offset { IntOffset(offsetX.value.roundToInt(), 0) }
+                .offset { IntOffset((offsetX.value + nudgePx * nudgeFactor).roundToInt(), 0) }
                 .size(thumbSize)
                 .clip(CircleShape)
                 .background(thumbColor)

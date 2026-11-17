@@ -253,18 +253,9 @@ fun CountryServerListScreen(
                             onDismissRequest = { overflowMenuExpanded = false },
                             offset = DpOffset(x = 0.dp, y = 8.dp),
                             containerColor = HollowInk,
-                            shape = RoundedCornerShape(22.dp),
-                            modifier = Modifier.width(248.dp)
+                            shape = RoundedCornerShape(18.dp),
+                            modifier = Modifier.width(212.dp)
                         ) {
-                            ServerOverflowMenuItem(
-                                icon = Icons.Outlined.Schedule,
-                                label = "Update all",
-                                color = HollowCream,
-                                onClick = {
-                                    overflowMenuExpanded = false
-                                    onRefresh()
-                                }
-                            )
                             ServerOverflowMenuItem(
                                 icon = Icons.Outlined.CheckCircle,
                                 label = "Select several",
@@ -813,19 +804,19 @@ private fun ServerOverflowMenuItem(
         text = {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(14.dp),
-                modifier = Modifier.padding(vertical = 4.dp)
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                modifier = Modifier.padding(vertical = 0.dp)
             ) {
                 Icon(
                     imageVector = icon,
                     contentDescription = null,
                     tint = color,
-                    modifier = Modifier.size(19.dp)
+                    modifier = Modifier.size(18.dp)
                 )
                 Text(
                     text = label,
                     style = MaterialTheme.typography.bodyLarge.copy(
-                        fontSize = 15.sp,
+                        fontSize = 14.sp,
                         fontWeight = FontWeight.Medium
                     ),
                     color = color

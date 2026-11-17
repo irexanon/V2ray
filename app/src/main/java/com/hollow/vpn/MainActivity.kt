@@ -57,6 +57,7 @@ import com.hollow.vpn.ui.VpnViewModel
 import com.hollow.vpn.ui.components.HollowBottomNavigationBar
 import com.hollow.vpn.ui.components.HollowBottomTab
 import com.hollow.vpn.ui.components.ServerQrShareDialog
+import com.hollow.vpn.ui.screens.HollowOnboardingScreen
 import com.hollow.vpn.ui.screens.AddServerScreen
 import com.hollow.vpn.ui.screens.ConnectedHomeScreen
 import com.hollow.vpn.ui.screens.CountryServerListScreen
@@ -187,6 +188,27 @@ fun HollowVpnApp(
         }
     }
 
+    // Getting-started "Allow & continue": notification prompt, then Android VPN consent, then finish onboarding
+    val onboardingVpnLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { _ ->
+        vpnViewModel.completeOnboarding(openAddServer = true)
+    }
+    val requestOnboardingPermissions = {
+        runWithNotificationPermission {
+            val consentIntent = try {
+                VpnService.prepare(context)
+            } catch (_: Exception) {
+                null
+            }
+            if (consentIntent != null && context is Activity) {
+                onboardingVpnLauncher.launch(consentIntent)
+            } else {
+                vpnViewModel.completeOnboarding(openAddServer = true)
+            }
+        }
+    }
+
     val requestOrToggleVpn = {
         if (telemetry.isConnected || telemetry.isConnecting) {
             vpnViewModel.toggleConnection()
@@ -216,7 +238,7 @@ fun HollowVpnApp(
         VpnScreen.CONNECTED_HOME -> HollowBottomTab.CONNECT
         VpnScreen.SERVER_LIST, VpnScreen.ADD_SERVER -> HollowBottomTab.SERVERS
         VpnScreen.SETTINGS -> HollowBottomTab.SETTINGS
-        VpnScreen.SPLASH_FETCHING -> HollowBottomTab.CONNECT
+        VpnScreen.SPLASH_FETCHING, VpnScreen.ONBOARDING -> HollowBottomTab.CONNECT
     }
 
     val navBackgroundColor = when {
@@ -329,6 +351,13 @@ fun HollowVpnApp(
                                     onCancelOrSkip = {
                                         vpnViewModel.navigateTo(VpnScreen.SERVER_LIST)
                                     }
+                                )
+                            }
+
+                            VpnScreen.ONBOARDING -> {
+                                HollowOnboardingScreen(
+                                    onFinish = { vpnViewModel.completeOnboarding(openAddServer = true) },
+                                    onRequestPermissions = requestOnboardingPermissions
                                 )
                             }
 

@@ -123,6 +123,12 @@ class VpnPreferencesStore(context: Context) {
         )
     }
 
+    fun isOnboardingDone(): Boolean = prefs.getBoolean("onboarding_done", false)
+
+    fun setOnboardingDone() {
+        prefs.edit().putBoolean("onboarding_done", true).apply()
+    }
+
     fun saveSettings(state: AppSettingsState) {
         prefs.edit()
             .putBoolean("auto_configure", state.autoConfigure)

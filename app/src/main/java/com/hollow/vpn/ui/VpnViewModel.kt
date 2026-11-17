@@ -42,7 +42,8 @@ enum class VpnScreen {
     SERVER_LIST,
     CONNECTED_HOME,
     SETTINGS,
-    ADD_SERVER
+    ADD_SERVER,
+    ONBOARDING
 }
 
 enum class AddServerTab(val title: String) {
@@ -62,7 +63,9 @@ data class ConnectionTelemetryState(
     val serverIpLabel: String = "—",
     val realPublicIpLabel: String = "Detecting…",
     val realPublicCountryCode: String = "XX",
-    val preConnectionIp: String = ""
+    val preConnectionIp: String = "",
+    /** 0 = idle, 1 = reaching server, 2 = handshake / starting tunnel, 3 = securing traffic (live verification). */
+    val connectStage: Int = 0
 ) {
     val formattedTimer: String
         get() {
@@ -106,8 +109,14 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private val _settings = MutableStateFlow(prefsStore.loadSettings())
     val settings: StateFlow<AppSettingsState> = _settings.asStateFlow()
 
-    private val _screenStack = MutableStateFlow(listOf(VpnScreen.CONNECTED_HOME))
-    private val _currentScreen = MutableStateFlow(VpnScreen.CONNECTED_HOME)
+    private val firstScreen =
+        if (!prefsStore.isOnboardingDone() && _settings.value.activeSubscriptionUrl.isBlank()) {
+            VpnScreen.ONBOARDING
+        } else {
+            VpnScreen.CONNECTED_HOME
+        }
+    private val _screenStack = MutableStateFlow(listOf(firstScreen))
+    private val _currentScreen = MutableStateFlow(firstScreen)
     val currentScreen: StateFlow<VpnScreen> = _currentScreen.asStateFlow()
 
     private val _selectedFilter = MutableStateFlow(ServerFilter.ALL)
@@ -225,6 +234,14 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private fun observeVpnServiceState() {
         var wasRunning = false
         viewModelScope.launch {
+            // Real stage reported by the service once it starts verifying the live tunnel
+            XrayVpnService.connectStage.collect { stage ->
+                if (stage >= 3) {
+                    _telemetry.update { if (it.isConnecting) it.copy(connectStage = 3) else it }
+                }
+            }
+        }
+        viewModelScope.launch {
             XrayVpnService.isServiceRunning.collect { running ->
                 if (running) {
                     wasRunning = true
@@ -233,6 +250,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                         it.copy(
                             isConnected = true,
                             isConnecting = false,
+                            connectStage = 0,
                             elapsedSeconds = 0L,
                             uploadBytes = 0L,
                             downloadBytes = 0L,
@@ -335,6 +353,16 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             val canAutoConnect = _settings.value.startOnAppOpen &&
                 (!_settings.value.tunMode || android.net.VpnService.prepare(getApplication()) == null)
 
+            if (!prefsStore.isOnboardingDone()) {
+                if (existing.isEmpty() && configuredSubUrl.isBlank()) {
+                    // Fresh install: stay on the getting-started screens
+                    _screenStack.value = listOf(VpnScreen.ONBOARDING)
+                    _currentScreen.value = VpnScreen.ONBOARDING
+                    return@launch
+                }
+                prefsStore.setOnboardingDone()
+            }
+
             _screenStack.value = listOf(VpnScreen.CONNECTED_HOME)
             _currentScreen.value = VpnScreen.CONNECTED_HOME
 
@@ -403,6 +431,13 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         } else {
             num * 3_600_000L
         }
+    }
+
+    fun completeOnboarding(openAddServer: Boolean = true) {
+        prefsStore.setOnboardingDone()
+        _screenStack.value = listOf(VpnScreen.CONNECTED_HOME)
+        _currentScreen.value = VpnScreen.CONNECTED_HOME
+        if (openAddServer) navigateTo(VpnScreen.ADD_SERVER)
     }
 
     fun navigateTo(screen: VpnScreen) {
@@ -506,7 +541,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         XrayVpnService.clearLastError()
-        _telemetry.update { it.copy(isConnecting = true) }
+        _telemetry.update { it.copy(isConnecting = true, connectStage = 1) }
 
         val isDirectOnly = _settings.value.routingMode.contains("Direct Only", ignoreCase = true)
         val livePing: Int? = if (isDirectOnly) {
@@ -539,7 +574,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
         _telemetry.update { prev ->
             prev.copy(
-                serverIpLabel = resolvedIp
+                serverIpLabel = resolvedIp,
+                connectStage = 2
             )
         }
         startAndroidVpnService(updatedServer)

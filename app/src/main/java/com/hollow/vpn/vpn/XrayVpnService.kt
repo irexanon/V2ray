@@ -202,6 +202,7 @@ class XrayVpnService : VpnService() {
 
         try {
             var tunFd = 0
+            setConnectStage(2)
             if (tunMode) {
                 val builder = Builder()
                     .setSession("Hollow VPN - $country ($host)")
@@ -248,6 +249,7 @@ class XrayVpnService : VpnService() {
                 return
             }
 
+            setConnectStage(3)
             val isDirectOnly = routingMode.contains("Direct Only", ignoreCase = true)
             if (!isDirectOnly) {
                 val verifiedDelay = verifyLiveTunnelDelay(core)
@@ -612,6 +614,11 @@ class XrayVpnService : VpnService() {
 
         private val _isServiceRunning = MutableStateFlow(false)
         val isServiceRunning: StateFlow<Boolean> = _isServiceRunning.asStateFlow()
+        private val _connectStage = MutableStateFlow(0)
+        val connectStage: StateFlow<Int> = _connectStage.asStateFlow()
+        internal fun setConnectStage(stage: Int) {
+            _connectStage.value = stage
+        }
         private val _lastError = MutableStateFlow<String?>(null)
         val lastError: StateFlow<String?> = _lastError.asStateFlow()
         private val _trafficSnapshot = MutableStateFlow(TunnelTrafficSnapshot())
